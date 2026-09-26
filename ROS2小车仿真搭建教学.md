@@ -777,3 +777,232 @@ bringup 依赖 description（要加载 URDF）；**description 绝不依赖 brin
 ### 学生提问（待复述）
 
 见对话区。
+
+### 补充：仿真与实车的边界（学生提问引发）
+
+**分层看，边界只有一层**：
+
+```
+   应用层     Qt GUI / Nav2 / SLAM               ← 仿真 & 实车 完全相同
+      ↕
+   接口层     /cmd_vel /odom /scan /tf           ← 完全相同（这就是「契约」的价值）
+      ↕
+   ┌──────────────┬──────────────────┐
+   │    实车侧     │      仿真侧       │        ← 只有这一层不同
+   │ MAVLink 桥    │  diff_drive 插件  │
+   │ ESP32 固件    │  Gazebo 物理      │
+   │ 电机 / 编码器 │  虚拟关节 / 碰撞  │
+   └──────────────┴──────────────────┘
+```
+
+#### Q1：URDF 只有仿真项目才写吗？
+
+**不是。URDF 是通用资产**——实车项目同样需要它，因为：
+
+- RViz 要显示机器人模型；
+- `base_link → laser_frame` 等**静态 TF** 要靠 `robot_state_publisher` 从 URDF 发布；
+- Nav2 / SLAM 依赖完整的 TF 树。
+
+**但 URDF 的内容分两类**：
+
+| URDF 内容 | 实车 | 仿真 |
+|---|---|---|
+| link / joint 层级（TF 树） | ✅ 必用 | ✅ 必用 |
+| visual | ✅ RViz 显示 | ✅ |
+| collision | ❌ 真车自己就会碰 | ✅ **物理碰撞必需** |
+| inertial | ❌ 真车有真实质量 | ✅ **物理仿真必需** |
+| **Gazebo 插件 / `<gazebo>` 标签** | ❌ **完全不用** | ✅ **核心** |
+
+> **重要纠正**：现有项目的 `xuegecar.urdf` 缺 collision / inertial / 插件——**这不是缺陷**，而是**它只服务实车**，尚无仿真需求。
+
+#### Q2：「操作小车」在实车和仿真里有什么区别？
+
+**上层一字不改，只换最下面一层。**
+
+| 层面 | 实车 | 仿真 |
+|---|---|---|
+| 谁接收 `/cmd_vel` | ESP32（经 MAVLink / micro-ROS） | `diff_drive` 插件 |
+| 运动学计算 | ESP32 固件 | 插件 |
+| 电机驱动 | 真实 PWM | Gazebo 物理 |
+| 里程计来源 | 编码器 → 固件积分 | Gazebo 物理积分 |
+| teleop / RViz / Nav2 | **完全相同** | **完全相同** |
+
+**判断口诀**：问自己「这东西是**描述**机器人，还是**驱动 / 模拟**机器人？」
+
+- 描述（URDF 的 TF 部分）→ 两边都要
+- 模拟物理（collision / inertial / 插件）→ 仿真专用
+- 驱动硬件（固件 / 电机 / 编码器）→ 实车专用
+
+> **局限提醒**：仿真是理想世界——无噪声、无延迟、不打滑。**仿真跑通 ≠ 实车能跑通。**
+
+### 3.1 实测：`colcon build` 成功了，为什么 `ros2 pkg list` 看不到？
+
+**实测输出**：
+```
+$ colcon build
+Summary: 2 packages finished [2.14s]      ← 构建成功
+
+$ ros2 pkg list | grep xuegecar_sim       ← 空！一行都没有
+```
+
+**根因：构建成功 ≠ 包可见。中间隔着一次 `source`。**
+
+ROS2 的环境是**叠加（overlay）**的：
+
+```
+/opt/ros/humble/                 ← underlay（系统安装的底座）
+        +
+~/xuegecar_sim_ws/install/       ← overlay（你新建的这一层）
+        ↓
+   source install/setup.bash 之后，两层合并
+        ↓
+   ros2 pkg list 才能看得到你的包
+```
+
+`colcon build` 只是把包**安装到** `install/` 目录；`ros2` 命令**并不认识它**，直到你把这个目录 **source 进当前终端的环境变量**（本质是往 `AMENT_PREFIX_PATH` / `PATH` 里加路径）。
+
+**解决**：
+
+```bash
+source ~/xuegecar_sim_ws/install/setup.bash
+ros2 pkg list | grep xuegecar_sim     # 现在应看到两行
+```
+
+**验证安装位置**：
+
+```bash
+ros2 pkg prefix xuegecar_sim_description
+# → ~/xuegecar_sim_ws/install/xuegecar_sim_description
+```
+
+**每次改代码后的固定动作**：`colcon build` → **重开终端或重新 source**。
+
+> 类比（给有 MCU 背景的人）：这就像 `make` 出了固件却没烧进芯片——文件在磁盘上躺着，但"运行环境"还不知道它的存在。`source` = 烧录 + 重启。
+
+### 3.2 URDF 脚手架（全阶段最容易翻车的一步）
+
+**目标**：RViz 里看到一辆**静止**的小车。**先不挂任何插件**——把「模型对不对」和「物理能不能跑」**分开验证**。
+
+**文件**：`~/xuegecar_sim_ws/src/xuegecar_sim_description/urdf/xuegecar_sim.urdf`
+
+#### 层级与坐标（一个自洽的方案）
+
+```
+base_footprint            ← z = 0（地面投影，虚拟点）
+   │ base_joint [fixed]，z 偏移 = +0.0325（= 轮半径）
+   ▼
+base_link                 ← 位于「轮心高度」
+   ├─ left_wheel_joint  [continuous]，origin (0, +0.085, 0)，axis (0,1,0)
+   ├─ right_wheel_joint [continuous]，origin (0, -0.085, 0)，axis (0,1,0)
+   └─ caster_joint      [continuous]，origin (-0.07, 0, -0.0175)
+```
+
+> 设计要点：把 `base_link` 放在**轮心高度**（= 轮半径），于是轮心相对 `base_link` 的 z 偏移正好为 0——坐标最干净。
+
+#### 每个 link 要什么
+
+| link | visual | collision | inertial |
+|---|---|---|---|
+| `base_footprint` | ❌ 不写 | ❌ **不写** | ❌ 不写 |
+| `base_link` | ✅ box 0.20×0.15×0.08，z=+0.04 | ✅ 同 visual | ✅ 质量 1.0 kg |
+| `left_wheel_link` | ✅ cylinder r=0.0325、长 0.02，**rpy 绕 x 转 90°** | ✅ 同 visual | ✅ 质量 0.1 kg |
+| `right_wheel_link` | 同上 | 同上 | 同上 |
+| `caster_link` | ✅ sphere r=0.015 | ✅ 同 visual | ✅ 质量 0.05 kg |
+
+#### 三个最容易翻车的点
+
+1. **轮子 joint 必须 `continuous`**——`revolute` 是「有角度上限」、`fixed` 是「焊死」，两者都会让车不动。
+2. **`<cylinder>` 默认沿 z 轴**——车轮是躺在 y 方向的，所以 `visual` / `collision` 的 `origin rpy` 要绕 x 转 90°（约 `1.5708 0 0`）。否则轮子会像「立着的硬币」。
+3. **`base_footprint` 绝不能有 `collision`**——它是虚拟的地面投影点；给它碰撞体会和地面打架，车会乱跳。
+
+#### 验证（暂不涉及 Gazebo）
+
+```bash
+cd ~/xuegecar_sim_ws/src/xuegecar_sim_description/urdf
+ros2 run robot_state_publisher robot_state_publisher \
+  --ros-args -p robot_description:="$(cat xuegecar_sim.urdf)" -p use_sim_time:=false
+```
+
+另开终端：
+
+```bash
+rviz2      # 左侧 Add → RobotModel；Fixed Frame 设为 base_footprint
+```
+
+**判据**：RViz 里出现一辆**静止的小车**——轮子在两侧，车体在上方。
+若解析失败，`robot_state_publisher` 会直接打印报错（很多情况下带有问题的行号）——**照着改**。
+
+#### 常见错误
+
+| 现象 | 根因 |
+|---|---|
+| RSP 启动即报错 | URDF 语法错（标签未闭合、属性名拼错、数值分隔符用了逗号） |
+| RViz 看不到模型 | 没设 Fixed Frame，或 `robot_description` 参数为空 |
+| 模型「零件分离」 | joint 的 `origin` 算错 |
+| 轮子竖着像硬币 | cylinder 没转 90° |
+
+#### 小教训（3.1 实测中发现）
+
+学生把 `echo "source ..." >> ~/.bashrc` **执行了两次**，导致 `~/.bashrc` 里出现两行重复。
+`>>` 是**追加**，重复执行就会重复写入。修正：
+
+```bash
+sed -i '\|xuegecar_sim_ws/install/setup.bash|d' ~/.bashrc   # 先删干净
+echo "source ~/xuegecar_sim_ws/install/setup.bash" >> ~/.bashrc
+```
+
+### 教学分工约定（学生提问澄清）
+
+**问**：URDF 的层级与坐标方案，是老师写还是学生写？
+
+**答**：
+
+- **设计归老师**：层级、坐标、数值、为什么——已完成（见上）。
+- **URDF 文件归学生**：把它翻译成 XML 语法。
+- **老师不给完整文件**——这是学生自己定的规则（不输出完整 URDF / launch 文件）。
+
+**为什么这么分**：
+
+- 本课目标是**「理解设计」**，不是**「拿到成品」**。
+- 「写」这一步会**暴露理解缺口**——对不上的地方，正是学习发生的地方。
+- 数值是**可以被质疑**的：轮距为什么 0.17？`base_link` 为什么放在轮心高度？这些是设计决策，学生可以推翻并给出自己的理由。
+
+**老师提供的弹药**：
+
+1. 设计（层级 / 坐标 / 数值表）；
+2. 语法参照：ROS 2 官方 URDF 教程；以及现有项目 `xuegecar.urdf`（**只看语法写法，不看设计取舍**）；
+3. 卡住随时问——给「片段级提示」，不给完整文件。
+
+**预判会卡住的地方**：
+
+- XML 语法本身（标签闭合、属性引号、数值**用空格分隔、不能用逗号**）；
+- `inertial` 的惯量矩阵；
+- `cylinder` 的 90° 旋转。
+
+**常用惯量公式**（实心体，绕自身质心）：
+
+| 形状 | Ixx | Iyy | Izz |
+|---|---|---|---|
+| 长方体 (x×y×z) | m(y²+z²)/12 | m(x²+z²)/12 | m(x²+y²)/12 |
+| 圆柱（轴沿 z，半径 r，高 h） | m(3r²+h²)/12 | m(3r²+h²)/12 | m·r²/2 |
+| 球（半径 r） | 2mr²/5 | 2mr²/5 | 2mr²/5 |
+
+> 注：URDF 的惯量是在**自身 link 坐标系**下给出的；若 link 的几何有旋转，惯量矩阵原则上要随之变换——**打样阶段可以先填近似值**，阶段 4 再精算。
+
+### 教学分工约定（修订）
+
+**规则变更**：原「不输出完整代码 / URDF / launch」条款**作废**。
+
+**变更原因**：学生从「只想看流程」转为「要实际复现」，无法自行手写全套代码。
+
+**新分工**：
+
+- **老师写代码**——可直接写入学生的 WSL 工程目录（省去手抄）。
+- **写一步、讲一步**：每步都要说明「现在要干什么 / 判断标准是什么」。
+- **一次只加一个东西**：每步都能独立验证。
+- 学生负责：跑验证、看结果、提问题。
+
+**长期目标**：让学生学会「**如何指挥 AI 做工程 + 验证 AI 的产出**」——这比手写 XML 更有价值。
+
+**技术备忘**：跨 Windows→WSL 写文件的通路
+`write_file` 写到 Windows 侧 → `wsl -e bash -c "cp /mnt/c/... /home/y/..."` → `sed -i "s/\r$//"` 去 CRLF。
