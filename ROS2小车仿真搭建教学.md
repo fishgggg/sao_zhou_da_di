@@ -628,3 +628,152 @@ bringup 依赖 description（要加载 URDF）；**description 绝不依赖 brin
 ### 学生提问（待复述）
 
 见对话区。
+
+---
+
+## 阶段 3 · 仿真最小闭环（核心阶段）
+
+### 本步目标
+
+**让轮子第一次转起来。** 打通：遥控 → `/cmd_vel` → 差速插件 → 轮子关节 → `/odom` → TF → RViz。
+
+### 为什么现在做这一步
+
+- 这是整门课**第一个能"看见"的里程碑**：屏幕里一辆小车，按键盘它就走。
+- 在此之前所有东西都在纸上；**从这里开始，图纸变成文件**。
+- 不先打通这条最底层的闭环，后面的 SLAM / Nav2 / Qt GUI **统统无法脱离实车调试**。
+
+### 前置输入
+
+- 阶段 1 接口表（`/cmd_vel` `/odom` `/joint_states` `/clock` `/tf`）
+- 阶段 2 包结构（`description` + `bringup`）
+- 代码位置：`~/xuegecar_sim_ws/`（**WSL 原生文件系统，不放 `/mnt/c`**，否则 `colcon build` 慢数倍）
+
+---
+
+### 〇、拆成三小步（每步都能独立验证）
+
+| 小步 | 做什么 | 独立验证 |
+|---|---|---|
+| **3.1** | 建两个**空包**（只有 `package.xml` + `CMakeLists.txt`） | `colcon build` 通过；`ros2 pkg list` 看得到 |
+| **3.2** | 写 **URDF**（纯模型，先不挂插件） | `robot_state_publisher` + RViz 里看到一辆静止的小车 |
+| **3.3** | 挂 **diff_drive 插件** + 写 launch + 遥控 | 车能动能转，`/odom` 有数据，TF 树完整 |
+
+> 这就是「最小可运行单元 → 逐条接线」心法的实操：**每加一样东西，立刻验证一次。**
+
+### 一、施工清单（要建的文件）
+
+```
+~/xuegecar_sim_ws/
+└── src/
+    ├── xuegecar_sim_description/
+    │   ├── urdf/xuegecar_sim.urdf        ← 机器人模型 + Gazebo 差速插件
+    │   ├── meshes/                       ← 阶段 3 留空（用基本几何体）
+    │   ├── rviz/sim.rviz                 ← 可选
+    │   ├── package.xml
+    │   └── CMakeLists.txt
+    └── xuegecar_sim_bringup/
+        ├── launch/gazebo.launch.py       ← 起 gazebo + RSP + spawn
+        ├── config/                       ← 阶段 3 可空
+        ├── package.xml
+        └── CMakeLists.txt
+```
+
+> 阶段 3 用**纯 URDF**（`xuegecar_sim.urdf`），阶段 4 才转 xacro 参数化——**先跑通，再精修**。
+
+### 二、URDF 骨架（结构说明，非代码）
+
+**link 清单（5 个）**：
+
+| link | 角色 | 需要 collision? |
+|---|---|---|
+| `base_footprint` | 地面投影（虚拟点） | ❌ **不要** |
+| `base_link` | 车体主体 | ✅ |
+| `left_wheel_link` | 左轮 | ✅ |
+| `right_wheel_link` | 右轮 | ✅ |
+| `caster_link` | 万向轮 | ✅ |
+
+**joint 清单（4 个）**：
+
+| joint | 连接 | 类型 | 关键 |
+|---|---|---|---|
+| `base_joint` | base_footprint → base_link | `fixed` | — |
+| `left_wheel_joint` | base_link → left_wheel_link | **`continuous`** | ⚠️ 必须能无限旋转 |
+| `right_wheel_joint` | base_link → right_wheel_link | **`continuous`** | ⚠️ 同上 |
+| `caster_joint` | base_link → caster_link | `continuous` / `fixed` | 见「常见错误」 |
+
+**每个实体 link 的三件套**（新手最容易漏）：
+
+| 元素 | 作用 | 漏了会怎样 |
+|---|---|---|
+| `visual` | 看得见 | 模型透明 |
+| `collision` | 碰得到 | **穿地、穿墙** |
+| `inertial` | 质量 / 惯量 | Gazebo 警告，物理行为飘忽 |
+
+**打样用的典型值**（阶段 11 对着实车校准）：
+
+| 量 | 值 |
+|---|---|
+| 车体尺寸 | 0.20 × 0.15 × 0.08 m |
+| 轮半径 | 0.0325 m |
+| 轮宽 | 0.02 m |
+| 轮距（左右轮心距） | 0.17 m |
+| 车体质量 | ~1.0 kg |
+| 单轮质量 | ~0.1 kg |
+
+### 三、Gazebo 差速插件（本阶段的心脏）
+
+在 URDF 里挂 `libgazebo_ros_diff_drive.so`——**它就是仿真世界里的 ESP32 底盘**。
+
+| 参数 | 含义 |
+|---|---|
+| `left_joint` / `right_joint` | 左右轮关节名 |
+| `wheel_separation` | 轮距 |
+| `wheel_diameter` | 轮径 |
+| `max_wheel_torque` | 力矩上限 |
+| `max_wheel_acceleration` | 加速度上限 |
+| `publish_odom` | 是否发 `/odom` |
+| `publish_odom_tf` | 是否发 `odom → base_footprint` TF |
+| `odom_frame` / `base_frame` | frame 名 |
+
+> 它一个人干三件事：**收 `/cmd_vel`、算差速运动学、发 `/odom` + TF**。
+
+### 四、launch 干三件事
+
+`gazebo.launch.py` 负责按顺序：
+
+1. 启动 **Gazebo**（物理世界）
+2. 启动 **`robot_state_publisher`**（读 URDF，发连杆 TF）
+3. 启动 **`spawn_entity`**（把机器人放进世界）
+
+⚠️ **顺序有讲究**：模型必须等 Gazebo 起来后再 spawn，否则丢进虚空。
+
+### 五、验证（逐级递进）
+
+| # | 命令 | 期望 |
+|---|---|---|
+| 1 | `ros2 launch xuegecar_sim_bringup gazebo.launch.py` | Gazebo 里出现小车 |
+| 2 | `ros2 topic list` | 见 `/cmd_vel` `/odom` `/joint_states` `/clock` `/tf` |
+| 3 | `ros2 run teleop_twist_keyboard teleop_twist_keyboard` | 按键 → **车动** |
+| 4 | `ros2 run tf2_tools view_frames` | TF 树完整、无断链 |
+| 5 | `ros2 topic hz /odom` | 有稳定频率 |
+
+### 六、常见错误（按踩中概率排序）
+
+| 现象 | 根因 |
+|---|---|
+| 车纹丝不动 | 轮子 joint 用了 `revolute` / `fixed`，不是 `continuous` |
+| 车原地打转 / 走歪 | 左右轮**轴向**反了，或 `wheel_separation` 填错 |
+| 车穿过地面或墙 | `collision` 缺失 |
+| Gazebo 警告 inertial、车体抖动发飘 | `inertial` 缺失或数值离谱 |
+| 模型掉进虚空 | `spawn_entity` 比 Gazebo 起得早 |
+| `base_footprint` 与地面打架 | 给它加了 `collision`（它是虚拟点） |
+| TF 报 `extrapolation into the future` | 没开 `use_sim_time` |
+
+### 七、下一步
+
+**阶段 4 · 机器人描述工程化**：把"能跑的 URDF"升级为参数化 xacro——**为什么需要它，那时的痛点会自己冒出来**。
+
+### 学生提问（待复述）
+
+见对话区。
