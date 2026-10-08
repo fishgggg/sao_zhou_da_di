@@ -1006,3 +1006,197 @@ echo "source ~/xuegecar_sim_ws/install/setup.bash" >> ~/.bashrc
 
 **技术备忘**：跨 Windows→WSL 写文件的通路
 `write_file` 写到 Windows 侧 → `wsl -e bash -c "cp /mnt/c/... /home/y/..."` → `sed -i "s/\r$//"` 去 CRLF。
+
+### 技巧：如何快速验证一段 URDF（本轮实测）
+
+**问题**：`robot_state_publisher` 是**常驻节点**，启动后不会自己退出——怎么在一条命令里验证它「能不能正常启动」？
+
+**答案**：用 `timeout` 包一层。
+
+```bash
+wsl -e bash -c 'source /opt/ros/humble/setup.bash; timeout 6 ros2 run robot_state_publisher robot_state_publisher --ros-args -p robot_description:="$(cat /path/to/xuegecar_sim.urdf)" 2>&1 | head -40'
+```
+
+**判读表**：
+
+| 输出 | 含义 |
+|---|---|
+| `got segment base_footprint` / `got segment base_link` | ✅ 解析成功，URDF 有效 |
+| 报错并退出 | ❌ URDF 语法问题（通常带行号） |
+| 无输出但没退出 | 进程活着，其实也是成功 |
+| exit=124 | `timeout` 正常终止（**不是错误**） |
+
+**通用模式**：想验证一个**常驻进程**能否正常启动 → `timeout N <命令>`，看启动阶段有没有报错。
+
+这正是「**绿非证明，复现即证**」的实操——不猜，让工具自己说话。
+
+**附带发现**：`xacro` **未安装**（阶段 4 需要，届时 `sudo apt install ros-humble-xacro`）。
+
+### 案例：AI 写错了配置，学生抓到了（3.2-a 收官）
+
+**事件链**：
+
+1. 老师写 `.rviz` 配置时，**凭记忆**填了插件类名 `tf2_ros/TransformListener`——**未经核实**。
+2. 学生运行后 RViz 报错：
+   ```
+   PluginlibFactory: The plugin for class 'tf2_ros/TransformListener' failed to load.
+   ... Declared types are  rviz_default_plugins/TF
+   ```
+   ——**报错文本自己给出了正确答案**。
+3. 修复：删除该段（RViz 自动使用默认的 TF）。
+4. 老师做**系统性排雷**：把 `.rviz` 里用到的每个 Class 与 RViz 插件注册表逐个对照 → **8/8 显示插件类全部 OK**。
+5. 但面板类 `rviz_common/Displays` / `rviz_common/Views` 报 MISSING——**与实际现象矛盾**（面板明明在工作）。
+6. 追查：它们在 `share/rviz_common/` 下**没有插件注册 XML**——属于 **RViz 内置类**，不走插件注册表。交叉验证：官方 `default.rviz` 用了同样的类名 → **合法**。
+
+**三条可复用教训**：
+
+1. **AI 的产出必须验证**——它会凭记忆写出不存在的类名 / API / 参数。
+2. **报错文本常常直接给出答案**（`Declared types are ...` 就是正确值）。
+3. **验证方法本身也可能有盲区**——当「检查结果」与「实际现象」矛盾时，先怀疑检查方法，别急着下结论。
+
+### 3.2-b 装上轮子（附一个必须知道的机制）
+
+**新增**：2 个 wheel link + 2 个 `continuous` 关节。
+
+#### 关键决策逐条
+
+| 决策 | 值 | 为什么 |
+|---|---|---|
+| 轮子位置 y | `±0.085` | = 轮距 0.17 的一半；REP-103 约定 **y 向左为正** |
+| 轮子位置 z | `0` | **因为 a 步已把 base_link 抬到轮心高度**——a 步埋的伏笔在此回收 |
+| 轮子位置 x | `0` | 轮子在车体中间 |
+| cylinder 姿态 | `rpy="1.5708 0 0"` | URDF 的 cylinder 默认轴沿 z（立着）；车轮要轴沿 y（躺下） |
+| joint 类型 | `continuous` | 无限旋转 |
+| joint axis | `(0,1,0)` | 绕 y 轴转 |
+| 惯量 Iyy | `m·r²/2` | 绕圆柱轴（y）的公式；Ixx = Izz 用 `m(3r²+h²)/12` |
+
+#### ⚠️ 必须知道的机制：fixed 与 movable 关节的 TF 发布方式不同
+
+**实测证据**（b 步 URDF 写入后只跑 RSP）：
+
+```
+A. 解析出的 link：base_footprint / base_link / left_wheel_link / right_wheel_link
+B. /tf_static：只有 base_footprint → base_link        ← 轮子不在里面！
+C. 只有 RSP 时 /tf：空
+```
+
+**原因**：
+
+| 关节类型 | RSP 怎么发 TF |
+|---|---|
+| `fixed` | 位置永远不变 → 直接算出来发到 `/tf_static`（发一次，永久有效） |
+| `continuous` / `revolute` / `prismatic` | **角度随时在变** → 必须先知道「当前角度」→ 从 `/joint_states` 读 → **没人发，就没有 TF** |
+
+**所以需要一个节点**：`joint_state_publisher`
+→ 读 URDF，为所有可动关节发布默认角度（全 0）到 `/joint_states`。
+
+> **回扣阶段 1**：节点图里那个 `joint_state_publisher` 方框，当时只是纸上一个名字；
+> 现在亲眼看到——**没有它，轮子在 RViz 里根本不会出现**。
+
+**本机额外发现**：`joint_state_publisher` **未安装**，需要
+`sudo apt install ros-humble-joint-state-publisher ros-humble-joint-state-publisher-gui`
+（`sudo` 需要密码，AI 代不了）。
+
+#### 启动方式（3 个终端）
+
+```bash
+# 终端 1：RSP（发 TF 骨架）
+ros2 run robot_state_publisher robot_state_publisher \
+  --ros-args -p robot_description:="$(cat ~/xuegecar_sim_ws/src/xuegecar_sim_description/urdf/xuegecar_sim.urdf)" \
+             -p use_sim_time:=false
+
+# 终端 2：关节状态（发 /joint_states，让轮子 TF 出现）
+ros2 run joint_state_publisher joint_state_publisher \
+  --ros-args -p robot_description:="$(cat ~/xuegecar_sim_ws/src/xuegecar_sim_description/urdf/xuegecar_sim.urdf)"
+
+# 终端 3：RViz
+rviz2 -d ~/xuegecar_sim_ws/src/xuegecar_sim_description/rviz/xuegecar_sim.rviz
+```
+
+#### 判据
+
+RViz 里应看到：**蓝色方块 + 两侧各一个黑色圆柱**，且**轮子底部正好落在地面网格上**。
+
+### 3.2-c + 3.3：万向轮 与「让车动起来」
+
+#### c 步：caster 为什么必须有
+
+差速小车只有两个**驱动轮**着地 → 前后方向没有支撑 → 在 Gazebo 里会「点头」甚至翻倒。
+caster（万向轮）提供**第三点支撑**，把两点支撑变成三点支撑。
+
+```
+       俯视
+   ┌─────────────┐
+   │   base_link │
+   │ ○         ○ │   ← 左右驱动轮（y = ±0.085）
+   │             │
+   │      ●      │   ← caster（x = -0.07，车尾）
+   └─────────────┘
+```
+
+**位置计算**：球半径 0.015，要接触地面 → 球心离地 0.015；
+相对 base_link（已在 0.0325 高度）→ `0.015 - 0.0325 = -0.0175`。
+
+**摩擦必须设 0**：`<gazebo reference="caster_link"><mu1>0</mu1><mu2>0</mu2></gazebo>`
+否则这个球会「拖住」小车，车跑不动或跑歪。
+
+#### 3.3：两个插件，两条闭环
+
+```
+[teleop_twist_keyboard]
+        │ /cmd_vel
+        ▼
+[gazebo_ros_diff_drive 插件]  ← 仿真世界里的「底盘」
+        ├─ 驱动 left / right_wheel_joint（物理）
+        ├─ 发 /odom
+        └─ 发 TF：odom → base_footprint
+        ▼
+[gazebo_ros_joint_state_publisher 插件]
+        │ /joint_states（轮子的真实转角）
+        ▼
+[robot_state_publisher]
+        ├─ /tf：base_link → left/right_wheel_link
+        └─ /tf_static：base_footprint → base_link
+```
+
+> **TF 的分工**：`odom→base_footprint` 由**插件**发（它知道车走到哪了）；
+> `base_link→wheel` 由 **RSP** 发（它读 URDF + joint_states）。**两条线，互不重叠。**
+
+#### launch 按顺序做三件事
+
+| # | 做什么 | 为什么 |
+|---|---|---|
+| 1 | 启动 Gazebo | 物理世界 |
+| 2 | 启动 robot_state_publisher | 读 URDF、发 TF，**并把 URDF 发到 `/robot_description` 话题** |
+| 3 | 延迟 5 秒后 spawn_entity | 从 `/robot_description` 话题读模型放进 Gazebo；**必须等 Gazebo 服务就绪**，否则掉进虚空 |
+
+#### 实测验证记录（AI 代跑，`gui:=false` 无头模式）
+
+| 检查 | 结果 |
+|---|---|
+| spawn | `Successfully spawned entity [xuegecar_sim]` |
+| 话题 | `/clock` `/cmd_vel` `/joint_states` `/odom` `/robot_description` `/tf` `/tf_static` |
+| 节点 | `/diff_drive` `/gazebo` `/robot_state_publisher` |
+| `/joint_states` | left / right / caster 三个关节都有 position 数据 |
+| `/tf_static` | `base_footprint → base_link` |
+| `/tf` | `odom → base_footprint`，以及 `left_wheel_link` / `right_wheel_link` / `caster_link` |
+| `/odom` | `frame_id: odom`、`child_frame_id: base_footprint`，有数据 |
+| 日志错误 | 无 |
+
+#### ⚠️ WSL2 的一个坑：DDS 发现慢（重要）
+
+测量 `/odom` 时曾出现 `topic [/odom] does not appear to be published yet`，
+但**实际是有数据的**——换个更长的采样窗口就收到了。
+
+**原因**：WSL2 下 ROS2 的节点发现（DDS discovery）比原生 Linux 慢，
+`ros2 topic hz` / `echo` 的默认采样窗口可能不够。
+
+**结论**：**在 WSL2 里做验证，给足时间（10 秒以上）；
+别把「一时没收到」直接判成「没有数据」——多测一次，换长时间版本。**
+
+#### 关键命令差异（与 a/b 步对比）
+
+| 阶段 | 启动方式 |
+|---|---|
+| a / b 步 | 手动分开跑 `robot_state_publisher`（+ `joint_state_publisher`）+ `rviz2` |
+| **3.3** | **一条 launch 全搞定**：`ros2 launch xuegecar_sim_bringup gazebo.launch.py` |
