@@ -1200,3 +1200,141 @@ caster（万向轮）提供**第三点支撑**，把两点支撑变成三点支�
 |---|---|
 | a / b 步 | 手动分开跑 `robot_state_publisher`（+ `joint_state_publisher`）+ `rviz2` |
 | **3.3** | **一条 launch 全搞定**：`ros2 launch xuegecar_sim_bringup gazebo.launch.py` |
+
+### 答疑：信息都放在哪？（阶段 3 收官问答）
+
+学生问：「小车的配件信息就是放在 `gazebo_ros_diff_drive` 里？它的初始放置坐标、旋转关系、连接程度，这些都存放在哪？」
+
+**答：不是。`gazebo_ros_diff_drive` 只存「怎么驱动」，配件信息全在 URDF。**
+
+| 你想知道的 | 它在哪 |
+|---|---|
+| 部件形状（车体 / 轮子） | URDF 的 `<visual>` / `<geometry>` |
+| 部件**位置** | URDF 的 `<origin xyz="...">` |
+| 部件**朝向 / 旋转** | URDF 的 `<origin rpy="...">` |
+| 部件之间**怎么连接** | URDF 的 `<joint type="fixed / continuous / ...">` |
+| 归属关系（谁是父） | URDF 的 `<parent>` / `<child>` |
+| 质量、惯量 | URDF 的 `<inertial>` |
+| **谁驱动轮子、怎么算 odom** | `gazebo_ros_diff_drive` 插件（**只做这件事**） |
+| **轮子转角从哪来** | `gazebo_ros_joint_state_publisher` 插件 |
+| **小车初始放在世界哪里** | ⚠️ **不在 URDF**——在 launch 的 `spawn_entity -z 0.05` |
+| 启动顺序 | launch 文件 |
+| RViz 显示什么 | `.rviz` 文件 |
+
+#### 一个措辞纠正
+
+`teleop_twist_keyboard` 是**发布者**（发 `/cmd_vel`）；
+`gazebo_ros_diff_drive` 是**订阅者**（收 `/cmd_vel`）。
+**没有谁在「订阅 teleop」**——两者通过**话题**间接连接，互不认识。
+
+#### 我们一共建了什么（实测清单）
+
+7 个文件，共 479 行：
+
+| 文件 | 行数 | 性质 |
+|---|---|---|
+| `xuegecar_sim_description/urdf/xuegecar_sim.urdf` | 216 | **内容：描述小车** |
+| `xuegecar_sim_bringup/launch/gazebo.launch.py` | 86 | **内容：组织启动** |
+| `xuegecar_sim_description/rviz/xuegecar_sim.rviz` | 96 | **内容：显示配置** |
+| `xuegecar_sim_description/CMakeLists.txt` | 23 | 样板：安装规则 |
+| `xuegecar_sim_bringup/CMakeLists.txt` | 22 | 样板：安装规则 |
+| `xuegecar_sim_description/package.xml` | 18 | 样板：包身份证 |
+| `xuegecar_sim_bringup/package.xml` | 18 | 样板：包身份证 |
+
+#### 为什么「感觉东西太少」是个正确的直觉
+
+对比手写 STM32 小车：
+
+| STM32 上要手写 | ROS2 仿真里 |
+|---|---|
+| GPIO / 定时器 / 中断初始化 | ❌ 框架负责 |
+| 编码器读取 | ❌ 插件负责 |
+| PID 闭环 | ❌ Gazebo 物理引擎 |
+| 运动学解算（差速） | ❌ diff_drive 插件 |
+| 串口 / 通信协议 | ❌ DDS 负责 |
+| 可视化 | ❌ RViz 负责 |
+
+**你写的：479 行。背后在跑的：Gazebo + ROS2，千万行量级。**
+
+> **这既是 ROS 的价值，也是它反直觉的地方：ROS2 项目的主体是「声明 + 接线」，不是「写算法」。**
+> 你从「什么都自己写」的 MCU 世界，跳到了「框架提供底座、你只搭结构」的世界。
+
+#### 但确实还缺东西（诚实的差距清单）
+
+- 传感器：`/scan` `/imu` `/battery_state` `/ultrasonic` → 阶段 5
+- 建图与定位 → 阶段 6
+- 导航 → 阶段 7
+- 任务状态机 / 自己的控制逻辑 → 阶段 8（现在全靠手动按 teleop）
+- 参数化（xacro）→ 阶段 4
+- 与实车接口（micro-ROS / MAVLink）→ 阶段 11 对照
+
+**「最小闭环」的意义不是「车能干活」，而是「链条通了、且每一步都能验证」。**
+
+---
+
+## 阶段 4 · 机器人描述工程化（xacro 参数化）
+
+### 本步目标
+
+把「手写 URDF」升级为「参数化 xacro」——**改一个数字，整车尺寸 / 质量 / 惯量跟着变**。
+
+### 为什么需要它（痛点驱动）
+
+阶段 3 的 URDF 里，同一个数字散落多处：
+
+- `0.17`（轮距）出现在：`left_wheel_joint` origin 的 `0.085`、右轮的 `-0.085`、插件 `wheel_separation`
+- `0.0325`（轮半径）出现在：`base_joint` 的 z、轮子 cylinder 的 radius、caster 的 z 计算
+
+**改一次轮距要改 3 处**，漏一处就前后矛盾（车走歪 / odom 算错）。
+
+### 三个 xacro 武器
+
+| 武器 | 作用 | 例子 |
+|---|---|---|
+| `<xacro:property>` | 定义变量 | `wheel_separation = 0.17` |
+| `${...}` | 表达式求值 | `${wheel_separation / 2}` |
+| `<xacro:macro>` | 复用结构 | 左右轮共用一份定义，传 `reflect=±1` |
+
+**最大收益**：**惯量也用公式算**，改尺寸后不必再手算。
+
+### 文件
+
+- 新增：`urdf/xuegecar_sim.urdf.xacro`（206 行）
+- 保留：`urdf/xuegecar_sim.urdf`（阶段 3 版，作为对照材料）
+- 改造：`launch/gazebo.launch.py`（改用 `Command(['xacro ', file])` 展开）
+
+### 行为保持验证（重构纪律）
+
+参数化后各量的值，必须与阶段 3 手写版一致。实测（Python 复算同一套公式）：
+
+| 量 | xacro 公式算得 | 阶段 3 硬编码 | 判定 |
+|---|---|---|---|
+| half_sep | 0.085 | 0.085 | OK |
+| wheel_diameter | 0.065 | 0.065 | OK |
+| body_z | 0.04 | 0.04 | OK |
+| caster_z | -0.0175 | -0.0175 | OK |
+| **body_ixx** | **0.0024083333** | **0.002408** | ⚠ 差 0.014% |
+| body_iyy | 0.0038666667 | 0.003867 | OK |
+| body_izz | 0.0052083333 | 0.005208 | OK |
+| wheel_ixx | 2.9739583e-05 | 2.974e-05 | OK |
+| wheel_iyy | 5.28125e-05 | 5.281e-05 | OK |
+| caster_i | 4.5e-06 | 4.5e-06 | OK |
+
+**关于那个 0.014% 的差异**：不是 bug——是阶段 3 手写时把 `0.0024083333...` 四舍五入成了 `0.002408`。
+**xacro 算出的是精确值，比手写版更准。** 参数化保住了行为，还顺手消掉了手写舍入误差。
+
+### 静态检查
+
+- xacro 文件 XML 语法：OK
+- launch 的 Python 语法：OK（`python3 -m py_compile`）
+- `colcon build`：通过
+
+### 待学生验证（AI 无法代跑）
+
+- `xacro` **未安装** → 需 `sudo apt install ros-humble-xacro`
+- 展开验证：`xacro <文件> | head`（结果可观察）
+- 启动验证：`ros2 launch xuegecar_sim_bringup gazebo.launch.py`
+
+### 下一步
+
+阶段 5 · 传感器接入（`/scan` `/imu` `/battery_state` `/ultrasonic`）
