@@ -2793,3 +2793,151 @@ TELEOP 状态下拦下了 N 条 nav 源速度。如果你用的是 teleop，请�
 
 - `MAPPING` / `LOCALIZING` 目前只是状态名 + 分权规则，**没有和 slam_toolbox / AMCL 联动**（进入时不会自动起 SLAM）。这属于 8.9 启动整合。
 - `NAVIGATING` 还不会自己调用 Nav2 —— 现在只是「准备好接收 Nav2 的速度」，谁去发 `NavigateToPose` 是 8.6 的事。
+
+---
+
+### 8.6 接 Nav2：从「听速度」到「发任务」
+
+前五步状态机都是**被动**的：别人发速度，它决定放不放行。这一步它第一次**主动**——收到目标点后调用 Nav2 的 `NavigateToPose` action，并跟踪结果。
+
+#### 为什么是 Action，不是 Topic 或 Service
+
+| | Topic | Service | **Action** |
+|---|---|---|---|
+| 方向 | 广播 | 请求-应答 | 请求-应答 **+ 过程反馈** |
+| 阻塞 | 不等 | 阻塞等结果 | 不阻塞，回调通知 |
+| 中途取消 | 无 | 无 | **能取消** |
+| 用在 | 传感器、速度 | 瞬时操作 | **长时间任务** |
+
+导航要跑几十秒、要报剩余距离、要能中途取消 —— 三个需求正好对应 Action 的三个特征。
+
+#### 新增的接口
+
+| 方向 | 名称 | 类型 | 说明 |
+|---|---|---|---|
+| 入 | `/mission_goal` | `geometry_msgs/PoseStamped` | 目标点（RViz 的 2D Goal Pose 也发这个） |
+| 出 | `/navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | 调 Nav2 的 action |
+| 出 | `/mission_state` | `std_msgs/String` | 仍是状态快照 |
+
+#### 四个关键实现点
+
+**① 异步，不能阻塞**
+`send_goal_async()` 返回 future，结果通过回调拿。如果在回调里 `spin_until_future_complete`，节点会卡死（20 Hz 安全回路、看门狗全停）。
+
+**② 离开 NAVIGATING 必须取消**
+```python
+if previous == 'NAVIGATING' and target != 'NAVIGATING':
+    self._cancel_navigation()
+```
+不取消，车会继续跑到终点——你切到 ESTOP，它还在动（虽然 ESTOP 会压零速，但 goal 还在跑，速度会继续来）。**取消是义务，不是优化。**
+
+**③ 目标接受超时兜底**
+发出目标后 10 秒还没被接受 → `ERROR`。`bt_navigator` 卡住时不会给你任何回调，只能自己看表。
+
+**④ 收到目标前的三道门**
+```python
+if self.state != 'IDLE':            # 只有 IDLE 能接新任务
+if self.faults_cleared():           # 数据必须健康
+if not self.nav_client.server_is_ready():   # Nav2 必须在线
+```
+
+#### 实测记录（隔离实例，Nav2 + Gazebo）
+
+**成功路径**（完整闭环）：
+
+```
+收到目标 (1.20, 1.00)，开始导航
+IDLE → NAVIGATING（听=nav）
+目标已被接受，开始执行
+导航中：剩余 1.95 m → 1.66 → 1.51 → … → 0.59 m
+导航成功 → IDLE
+NAVIGATING → IDLE（听=无）
+```
+
+期间 `转发=141`（Nav2 20 Hz × 约 7 秒），完成后 IDLE 下又拦下 21 条 nav 速度。
+
+**取消路径**（导航中发 `{data: IDLE}`）：
+
+```
+取消进行中的导航目标
+NAVIGATING → IDLE（听=无）
+导航已取消              ← 结果回调收到 STATUS_CANCELED
+```
+
+取消后连续两次读 odom：`-0.0082 → -0.0091`（1 mm 级抖动）——车停住了。
+
+#### ⚠️ 未通过的部分（Nav2 侧问题，需单独处理）
+
+**现象 A：取消后重新发目标，车不动**
+
+```
+controller_server: Failed to make progress
+controller_server: [follow_path] [ActionServer] Aborting handle.
+/cmd_vel 频率 21.8 Hz，但内容线性速度全 0
+```
+
+mission 侧转发正常（`转发=1184`），是 Nav2 的 controller 不出速度。属于 Nav2 的恢复逻辑问题（abort 后 behavior tree 进入 recovery 循环），
+**不是 8.6 代码的问题**。规避：取消后若要重新导航，先重启 Nav2。
+
+**现象 B：重启 Nav2 后容器卡住**
+
+```
+Action: /navigate_to_pose
+Action clients: 1    (/mission_control)
+Action servers: 0    ← 服务器根本没起
+```
+
+`bringup_launch.py` 的 `component_container_isolated` 起来了，但没有打印任何 lifecycle 日志（日志只有 3 行）。
+此时 mission 拒绝目标是**正确的**（`server_is_ready()` 返回 False 是事实，不是误判）。
+
+**诊断命令**（以后遇到先跑这一条）：
+
+```bash
+ros2 action info /navigate_to_pose     # Action servers 必须是 1
+```
+
+`ros2 action list` 只说明「graph 里有这个名字」，**不代表服务器可用**。这是两个不同的检查。
+
+#### 完整操作流程（学生版）
+
+```bash
+# [终端 A] 仿真
+ros2 launch xuegecar_sim_bringup gazebo.launch.py
+
+# [终端 B] Nav2（地图 + 参数 + 仿真时间）
+ros2 launch nav2_bringup bringup_launch.py \
+  map:=/home/y/my_map.yaml \
+  params_file:=/home/y/xuegecar_sim_ws/src/xuegecar_sim_bringup/config/nav2_params.yaml \
+  use_sim_time:=true
+# 判据：出现两次 "Managed nodes are active"（localization + navigation）
+
+# [终端 X] 确认 Nav2 真的在线（关键！）
+ros2 action info /navigate_to_pose     # Action servers 必须是 1
+
+# [终端 D] 状态机
+ros2 run xuegecar_sim_mission mission_control
+
+# [终端 X] 发目标（IDLE 状态下）
+ros2 topic pub --once /mission_goal geometry_msgs/msg/PoseStamped \
+  "{header: {frame_id: map}, pose: {position: {x: 1.2, y: 1.0, z: 0.0}, orientation: {w: 1.0}}}"
+```
+
+**判据**：
+1. 终端 D：`收到目标 (1.20, 1.00)` → `IDLE → NAVIGATING（听=nav）` → `目标已被接受`
+2. 终端 D：`导航中：剩余 X m` 持续下降
+3. Gazebo：车沿绿色路径移动
+4. 结束时：`导航成功 → IDLE`，`/mission_state` = `IDLE`
+
+**中途取消**：
+
+```bash
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: IDLE}"
+# 判据：取消进行中的导航目标 / NAVIGATING → IDLE / 导航已取消
+```
+
+#### 坐标怎么选
+
+车从 `(0,0)` 出发，房间 4×4（墙在 ±2.0），箱子在 `(0.8, 0.5)` 占 `0.4×0.4`。
+
+- ✅ 好目标：`(1.2, 1.0)`、`(1.5, 1.5)`、`(0.5, -1.5)`——离墙 ≥0.4 m，避开箱子
+- ❌ 坏目标：`(0, 0)`（原地，`xy_goal_tolerance` 直接判到达）、`(1.9, 0)`（贴墙）
