@@ -3371,3 +3371,117 @@ ros2 topic echo /car2/mission_state --once
 4. Nav2/SLAM 每车一套，各自的 `map` 也要加前缀
 
 **这不是 9.4 要完成的事**，9.4 的产出是「知道边界在哪」——比「会用参数」更值钱。
+
+---
+
+## 阶段 10 · 测试与调试
+
+### 核心产出：一条命令跑完的回归脚本
+
+`xuegecar_sim_bringup/scripts/regression.sh`（已 install 到 `lib/xuegecar_sim_bringup/`）
+
+```bash
+bash src/xuegecar_sim_bringup/scripts/regression.sh          # 假底盘，约 60 秒
+bash src/xuegecar_sim_bringup/scripts/regression.sh --sim    # Gazebo，约 120 秒
+```
+
+**设计原则**（比脚本本身重要）：
+
+| 原则 | 为什么 |
+|---|---|
+| 每步独立判定，失败不中断 | 一次能看到全部问题，而不是修一个跑一次 |
+| 只用 ros2 CLI + timeout | 不依赖额外 Python 包，换台机器也能跑 |
+| `trap cleanup EXIT` | 中途 Ctrl+C 也不留孤儿进程 |
+| 数值判定用阈值不用精确值 | 物理仿真有抖动，`1.074 > 0.3` 就够了 |
+
+### 11 项覆盖（阶段 8-9 的全部关键行为）
+
+| # | 检查 | 对应阶段 |
+|---|---|---|
+| 1 | 节点数 ≥ 3 | 9.1 |
+| 2 | 初始状态 IDLE | 9.2 |
+| 3 | IDLE 下速度被拦（位移 < 0.02） | 8.2 |
+| 4 | IDLE → TELEOP | 8.5 迁移表 |
+| 5 | TELEOP 下能动（位移 > 0.3） | 8.5 分权 |
+| 6 | TELEOP 不吃 nav 源（位移 < 0.02） | 8.5 分权 |
+| 7 | 进入 ESTOP | 8.3 |
+| 8 | ESTOP 压零速 | 8.3 |
+| 9 | TELEOP 不能覆盖 ESTOP（粘性） | 8.3 |
+| 10 | RESET 回 IDLE | 8.3 |
+| 11 | 杀掉 fake_chassis 后进 ERROR | 8.4 看门狗 |
+
+**实测**：`通过 11 项，失败 0 项 ✅`
+
+### 脚本自己也踩了两个坑（值得记住）
+
+**坑 1：`节点数 >= 3` 写成了 `gt 3`**
+
+第一次跑报 `[FAIL] 节点数 >= 3 实际=[3] 要求 gt 3`——不是系统坏了，是断言写错了
+（严格大于 vs 大于等于）。**测试代码也要被测试。**
+
+**坑 2：`SIGSTOP` 冻结进程触发 DDS 共享内存端口冲突**
+
+```
+[FAIL] 数据中断后进 ERROR
+实际=[RTPS_TRANSPORT_SHM Error] Failed init_port fastrtps_port17913:
+     open_and_lock_file failed
+```
+
+被 SIGSTOP 的进程仍占着 Fast DDS 的共享内存端口，新起的 `ros2 topic echo` 抢不到锁 →
+状态读回来的是错误文本而不是 `ERROR`。
+
+**两个修法**（都已落进脚本）：
+
+```bash
+# ① 强制走 UDP，彻底绕开共享内存
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+
+# ② 看门狗用 kill 而不是 SIGSTOP，且只验"进 ERROR"，
+#    恢复步骤（重启节点 + RESET）留给人工，因为重启不在脚本职责内
+```
+
+> 这是本项目第三次被「观测手段污染结论」咬到（前两次：撞墙污染急停、按键未进 raw 模式）。
+> 规律越来越清晰：**验证工具本身也是系统的一部分，它也会坏，而且坏起来更像被测对象坏了。**
+
+### 调试三件套
+
+**① ros2 bag：录现场，离线复现**
+
+```bash
+# 录（只录需要的话题，别录 /clock）
+ros2 bag record -o /tmp/run1 /odom /scan /cmd_vel_motor /mission_state
+
+# 看有什么
+ros2 bag info /tmp/run1
+
+# 回放（配合状态机：它能像真机一样收到 odom/scan）
+ros2 bag play /tmp/run1
+```
+
+**用途**：出问题时录一段给同事/给自己明天看，比口述「车抖了一下」有用一百倍。
+
+**② rqt_graph：看连接关系**
+
+```bash
+rqt_graph
+```
+一眼看出：谁在发 `/cmd_vel_motor`、谁在听、有没有两个发布者（多实例！）。
+
+**③ WSL2 资源检查**
+
+```bash
+wsl --status                    # WSL 版本（要 2）
+free -h                         # 内存
+nproc                           # 可用核数
+ros2 topic hz /clock            # 仿真实时因子：应接近 1000（1000 次/秒 = RTF 1.0）
+```
+`/clock` 频率掉到 200-300 说明仿真跑不动了（CPU 抢不到），这时候车卡顿不是代码问题。
+
+### 阶段 10 的验收
+
+```bash
+bash src/xuegecar_sim_bringup/scripts/regression.sh
+# 判据：通过 11 项，失败 0 项 ✅
+```
+
+**以后改任何东西，先跑这一条。** 绿了再谈新功能，红了先看哪一项退化了。
