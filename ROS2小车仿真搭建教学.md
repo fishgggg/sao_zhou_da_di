@@ -2491,7 +2491,11 @@ ros2 run xuegecar_sim_mission mission_control
 ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
 
 # ① 正常时不该报错：等 10 秒，看终端 D 的 [odom=…s scan=…s] 都接近 0
-# ② 制造故障：把 Gazebo 窗口关掉，或另开终端 killall gzserver
+# ② 制造故障：另开终端执行 killall gzserver
+#    ⚠️ 只关 Gazebo 窗口不管用：gui_required 默认 false，关窗口只结束 gzclient，
+#       gzserver 还在跑、/odom 继续发，看门狗不会触发。
+#       依据：/opt/ros/humble/share/gazebo_ros/launch/gzclient.launch.py:92
+#             /opt/ros/humble/share/gazebo_ros/launch/gzserver.launch.py:199
 #    判据：2 秒内终端 D 出现「!!! 看门狗：/odom 已 0.5xs 无数据 → ERROR」
 # ③ 此时 RESET —— 应被拒绝，并列出 /odom、/scan 都无数据
 ros2 topic pub --once /mission_command std_msgs/msg/String "{data: RESET}"
@@ -2586,7 +2590,7 @@ ros2 topic info /cmd_vel_motor -v | grep -E "count|Node name"
 | 步 | 操作 | 判据 |
 |---|---|---|
 | 1 | 等 10 秒 | 不是 ERROR，`[odom=0.0xs scan=0.0xs]` |
-| 2 | 关 Gazebo 窗口 / `killall gzserver` | 2 秒内 `!!! 看门狗：/odom 已 0.5xs 无数据 → ERROR` |
+| 2 | **`killall gzserver`**（只关窗口不够，见下） | 2 秒内 `!!! 看门狗：/odom 已 0.5xs 无数据 → ERROR` |
 | 3 | 发 `{data: RESET}` | 被拒，列出 `/odom`、`/scan` |
 | 4 | 终端 A 重新 launch，等 20 秒 | 状态**仍 ERROR**，日志 `数据已恢复，可以 RESET` |
 | 5 | 发 `{data: RESET}` | `ERROR → IDLE` |
