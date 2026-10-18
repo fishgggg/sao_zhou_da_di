@@ -1338,3 +1338,692 @@ caster（万向轮）提供**第三点支撑**，把两点支撑变成三点支�
 ### 下一步
 
 阶段 5 · 传感器接入（`/scan` `/imu` `/battery_state` `/ultrasonic`）
+
+### 技巧：不装进系统，也能用一个包（本轮实用）
+
+**问题**：阶段 4 需要 `xacro`，但系统里**没装**，而 `sudo apt install` 要密码，AI 代不了。
+
+**解法**：下载 deb → 解包 → `PYTHONPATH` 临时加载。
+
+```bash
+# 1. 下载（apt-get download 不需要 root，只下到当前目录）
+mkdir -p /tmp/xacro_dl && cd /tmp/xacro_dl
+apt-get download ros-humble-xacro
+
+# 2. 解包
+dpkg -x ros-humble-xacro_*.deb /tmp/xacro_lib
+
+# 3. 用 PYTHONPATH 临时加载（不写进系统）
+export PYTHONPATH=/tmp/xacro_lib/opt/ros/humble/local/lib/python3.10/dist-packages
+python3 -c "import xacro; print(xacro.__file__)"
+```
+
+**用途**：验证依赖、试用新包、排查版本问题——**不污染环境**。
+
+#### 用这个方法验证阶段 4 的 xacro 文件（全部通过）
+
+| 检查项 | 结果 |
+|---|---|
+| 展开 | ✅ 成功，输出 169 行 |
+| link 数 | 5（base_footprint / base_link / left_wheel / right_wheel / caster） |
+| `left_wheel_joint` origin | `0 0.085 0` ✅ |
+| `right_wheel_joint` origin | `0 -0.085 0` ✅（`reflect = -1` 与 `half_sep` 的乘法正确） |
+| `base_joint` origin | `0 0 0.0325` ✅（来自 `${wheel_radius}`） |
+| `wheel_separation` | `0.17` ✅ |
+| `wheel_diameter` | `0.065` ✅（来自 `${wheel_radius * 2}`） |
+| 惯量 | 全部为公式精确值 ✅ |
+
+**一个被实测否定的担心**：曾怀疑宏参数 `reflect="1"` 是字符串，`${reflect * half_sep}` 会抛 `TypeError`
+（Python 里 `"1" * 0.085` 确实会报错，已复现）。
+**实测：xacro 会把参数值求值成数字，不会报错。** 担心不成立，但排查过程是对的——**先有假设，再用实测否证**。
+
+### 补充：两个被学生纠正的点 + 一个关键机制（阶段 4）
+
+#### 纠正一：AI 的检查方法有盲区 —— `which xacro` 的假否定
+
+AI 用 `wsl -e bash -c "which xacro"` 判定「xacro 未安装」。
+但 **`wsl -e bash -c` 是非交互 shell，不读 `.bashrc`、不 source ROS 环境**，
+而 xacro 在 `/opt/ros/humble/bin/` —— 不 source 就找不到。
+
+带 source 重查 + `dpkg -l`：
+
+```
+ii  ros-humble-xacro  2.1.1-1jammy  ...   ← 实际早已安装
+```
+
+**教训**：**「找不到」不等于「不存在」**——先确认自己的查找条件是否覆盖了目标的真实位置。
+（这与「验证方法本身也可能有盲区」是同一条纪律的第二次实例。）
+
+#### 纠正二：AI 漏说了「遥控需要另开终端」
+
+AI 曾写「判据：小车照常出现、照常能遥控」，
+但 `ros2 launch xuegecar_sim_bringup gazebo.launch.py` **只做三件事**：
+
+1. 启动 Gazebo；
+2. 启动 `robot_state_publisher`；
+3. spawn 小车。
+
+**它不启动任何「发指令」的节点**。所以车会站着不动，必须**另开一个终端**跑：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+**教训**：写「判据」时，必须把**隐含的前置步骤**一并写出——读者不该为作者的省略买单。
+
+#### 关键机制：launch 读的是 install 副本（不是 src）
+
+实测 inode 对比：
+
+```
+inode=49035  src/.../xuegecar_sim.urdf.xacro
+inode=49601  install/.../xuegecar_sim.urdf.xacro     ← 不同 → 是复制出来的副本
+```
+
+因为 `get_package_share_directory()` 返回 **install** 路径，
+**所以改 `src` 里的 xacro 后，必须 `colcon build` 同步到 `install`**，否则 launch 仍读旧版。
+
+（开发时可用 `colcon build --symlink-install`——建符号链接，src 改动立即生效。）
+
+---
+
+## 阶段 5 · 传感器接入（仿真侧）
+
+### 本步目标
+
+给小车装上 **2D 雷达** 和 **IMU**，让 `/scan` 和 `/imu` 两个话题上线。
+
+### 关键结构：Gazebo 传感器 ≠ ROS 话题
+
+```xml
+<gazebo reference="laser_frame">              <!-- ① 挂在哪根 link 上 -->
+  <sensor name="laser" type="ray">            <!-- ② Gazebo 的传感器本体 -->
+    <ray><scan><horizontal>...</horizontal></scan><range>...</range></ray>
+    <update_rate>10</update_rate>
+    <plugin filename="libgazebo_ros_ray_sensor.so">   <!-- ③ 桥：把 Gazebo 数据转成 ROS 话题 -->
+      <ros><remapping>~/out:=scan</remapping></ros>
+      <output_type>sensor_msgs/LaserScan</output_type>
+      <frame_name>laser_frame</frame_name>
+    </plugin>
+  </sensor>
+</gazebo>
+```
+
+**没有第 ③ 层，Gazebo 里的传感器数据就出不来**——这正是 `gazebo_ros_pkgs` 存在的意义。
+
+### 本步新增的命名对象
+
+| 类型 | 名称 |
+|---|---|
+| link | `laser_frame`、`imu_link`（都用 `fixed` joint 连到 `base_link`） |
+| 话题 | `/scan`（`sensor_msgs/LaserScan`）、`/imu`（`sensor_msgs/Imu`） |
+| 插件 | `libgazebo_ros_ray_sensor.so`、`libgazebo_ros_imu_sensor.so` |
+| TF | `base_link → laser_frame`、`base_link → imu_link`（RSP 自动发布，无需额外配置） |
+
+### ⚠️ 实测发现的坑：雷达「看到自己」
+
+**第一版**把雷达装在**车体顶面**（z = 0.08）。实测 `/scan`：
+
+```
+ranges = [0.0999, 0.1000, ..., 0.0752, 0.1215, ...]    ← 前 87 个值 0.075 ~ 0.124
+         后面全是 inf
+```
+
+**数值本身就是线索**：`0.075` = 车体**半宽**，`0.100` = 车体**半长** —— 雷达在扫自己的车壳！
+
+**修复**：抬高 2 cm（`laser_standoff = 0.02`）→ 复验：
+
+```
+laser_joint z 偏移: 0.0 0.0 0.1
+/scan 中「非 inf」读数个数: 0        ← 虚假近距点全部消失
+```
+
+**这个过程值得记住**：观察异常 → 提出假设 → **用数值特征验证假设** → 修复 → 复验。
+
+> 这也是**真实工程问题**：真车上的雷达同样需要支架把它抬离车体，否则会测到自己的车壳。
+
+### 空世界里 /scan 全是 inf 是正常的
+
+Gazebo 默认世界里**只有地面、没有障碍物**。2D 雷达水平扫描自然什么都打不到。
+想看真实数据，需要往世界里放几个物体。
+
+### 实车 ↔ 仿真 对照
+
+| 话题 | 仿真侧 | 实车侧 |
+|---|---|---|
+| `/scan` | ✅ `libgazebo_ros_ray_sensor.so` | ✅ Camsense 雷达驱动 |
+| `/imu` | ✅ `libgazebo_ros_imu_sensor.so` | ✅ LSM6DS3 驱动 |
+| `/battery_state` | ❌ **Gazebo Classic 无官方插件** | ✅ 电池 ADC |
+| `/ultrasonic` | ⚠ 可用 ray_sensor 模拟（本阶段未做） | ✅ HC-SR04 |
+
+**`/battery_state` 是「实车有、仿真无」的** —— 又一个差异点，阶段 11 汇总。
+
+### 验证记录（AI 代跑，无头模式）
+
+| 检查 | 结果 |
+|---|---|
+| 话题 | `/scan` `/imu` 均出现 ✅ |
+| `/imu` 数据 | 四元数 w≈1、x/y/z≈0（车水平）✅ |
+| `/scan` 数据 | 360 个距离值 ✅（修复后虚假近距点 0 个） |
+| 日志错误 | 0 个 ✅ |
+
+### 补充：为什么空世界里 /scan 全是 inf？（学生提问 + 实验证明）
+
+**学生的初始理解**：「世界是平坦的，没有反弹，所以没有有效数据。」
+
+**实测否定**：往世界里加**四面墙 + 一个箱子**（地面依旧是平的）：
+
+```
+[非 inf 读数个数] 360        ← 全部 360 个读数都有效
+[最小读数] 0.668
+[最大读数] 2.752
+```
+
+**所以「平坦」不是原因。**
+
+#### 真正的原因：几何（射线方向 vs 物体位置）
+
+2D 雷达是**水平扫描**——360 条射线全部在**同一个水平面**上射出。
+
+```
+        雷达（离地约 0.13 m）
+   ──────────●──────────      ← 射线在这个高度水平射出
+   ════════════════════════    ← 地面（z = 0）
+```
+
+**射线与地面平行 → 永远不相交 → 打不到地面。**
+
+- **空世界**：只有地面（在雷达下方）→ 射线什么都碰不到 → 全 `inf`
+- **有墙 / 箱子**（高度 1.0 m / 0.5 m，覆盖了 0.13 m 这一层）→ 射线撞上 → 有回波
+
+> **「平坦」无关紧要；「有没有东西立在射线的高度上」才是关键。**
+
+#### 顺带验证了读数的物理正确性
+
+| 读数 | 对应物体 | 几何计算 | 吻合 |
+|---|---|---|---|
+| 最小 **0.668 m** | 箱子最近角 | 箱子中心 (0.8, 0.5)、半边长 0.2 → 最近角距原点 ≈ 0.67 | ✅ |
+| 最大 **2.752 m** | 墙的对角 | 房间 4×4，对角 ≈ 2.83，扣墙厚 0.1 | ✅ |
+
+**数值对得上，说明整条仿真链（URDF 尺寸 → Gazebo 物理 → 雷达射线 → ROS 消息）是准的。**
+
+#### 本次新增的工程产物
+
+- `xuegecar_sim_bringup/worlds/room.world`（4m×4m 房间 + 一个箱子）
+- `gazebo.launch.py` 新增 `world:=` 参数（默认 `room.world`）
+- `bringup/CMakeLists.txt` 增加安装 `worlds` 目录
+
+**这同时为阶段 6 建图铺好了路**——建图需要一个「有边界的房间」。
+
+### 阶段 6 的技术路线变更（环境约束导致）
+
+**原计划**：GMapping（学生任务书建议）。
+
+**实测环境（apt 源实际可装情况）**：
+
+| 包 | 可装版本 |
+|---|---|
+| `ros-humble-slam-toolbox` | ✅ 2.6.10 |
+| `ros-humble-cartographer` | ✅ 2.0.9004 |
+| **`ros-humble-slam-gmapping`** | ❌ **apt 源中不存在** |
+| `ros-humble-nav2-bringup` | ✅ 1.1.20 |
+
+**变更**：GMapping → **slam_toolbox**。
+
+**理由**：
+
+1. GMapping 的 ROS2 移植不在 Humble 官方 deb 中，需要源码编译 `openslam_gmapping` + `slam_gmapping`，成本高、易踩编译坑；
+2. `slam_toolbox` 是 Humble 官方维护的 2D SLAM；
+3. **接口需求与 GMapping 完全一致**：`/scan` + `/odom` + TF → `/map`，学到的知识可完整迁移；
+4. 阶段 11 对照真实项目的 GMapping 时，差异落在「实现不同、接口相同」——本身就是好教材。
+
+**安装**：
+
+```bash
+sudo apt install ros-humble-slam-toolbox
+# 阶段 7 的 Nav2 可一并装：
+sudo apt install ros-humble-nav2-bringup ros-humble-navigation2
+```
+
+---
+
+## 阶段 6 · 建图与定位（slam_toolbox）
+
+### 为什么选 slam_toolbox（而非 GMapping）
+
+见前节「阶段 6 的技术路线变更」：GMapping 的 ROS2 移植不在 Humble apt 源中。
+
+### 它要什么、给什么
+
+```
+/scan ─────┐
+           ├──▶ [slam_toolbox] ──▶ /map
+/odom ─────┤                   └──▶ TF: map → odom
+TF 树 ─────┘
+```
+
+**它唯一新增的 TF 是 `map → odom`。**
+
+完整的 TF 链因此变成：
+
+```
+map → odom → base_footprint → base_link → laser_frame
+ ↑      ↑           ↑               ↑            ↑
+SLAM   插件       插件             RSP          RSP
+(新增) (已有)     (已有)          (已有)       (已有)
+```
+
+### 为什么需要 `map → odom` 这条 TF
+
+- **`odom` 会漂移**：车轮打滑、积分误差、模型误差，走久了就偏了；
+- **`map` 不漂移**：它是固定的世界坐标系；
+- SLAM 用「看到的环境」估计 odom 的漂移量，**把它补偿掉**。
+
+> **这就是「定位」的本质：用一个不漂移的参考系，去纠正一个会漂移的参考系。**
+
+### 启动（三个终端）
+
+```bash
+# 1. 仿真
+ros2 launch xuegecar_sim_bringup gazebo.launch.py
+
+# 2. SLAM（自带 launch；use_sim_time 默认就是 true）
+ros2 launch slam_toolbox online_async_launch.py
+
+# 3. 遥控（车必须动，地图才会长出来）
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+### 验证
+
+```bash
+ros2 topic list | grep -E "map|scan"
+ros2 topic echo /map --once | head -5
+ros2 run tf2_tools view_frames    # 应出现 map → odom → base_footprint → base_link → laser_frame
+```
+
+**RViz 里**：Add → Map（Topic 选 `/map`）+ Add → LaserScan（Topic 选 `/scan`），
+遥控小车在房间里转一圈，地图应该逐渐「长」出来。
+
+### 常见错误（预判）
+
+| 现象 | 根因 |
+|---|---|
+| 地图不生成 / 不动 | **车没动**（SLAM 需要运动才能建图） |
+| TF 报 `map` 不存在 | slam_toolbox 没启动，或 `use_sim_time` 不一致 |
+| 地图扭曲 / 重影 | odom 漂移大，或雷达外参不准 |
+| RViz 里看不到地图 | Map display 的 Topic 没设成 `/map`，或 Fixed Frame 不是 `map` |
+
+### 阶段 5 的验证澄清（学生提问）
+
+**学生说**：「没有按键控制，所以反馈的数据都是没有变化的。」
+
+**需分清「没有数据」与「数据不变」**：
+
+| 传感器 | 车静止时 | 车运动时 |
+|---|---|---|
+| `/scan` | **有数据**（扫到墙/箱子），数值**不变**（视角没变） | 数值**变化** |
+| `/imu` | **有数据**（重力方向；角速度≈0、加速度≈−g） | 数值**变化** |
+
+**结论**：「数据不变」≠「没有数据」。车不动时，静态数据是正常的；想看变化，需要让车动起来。
+
+### 阶段 6 验证记录（AI 代跑，无头模式）
+
+**方法**：启动仿真 + slam_toolbox，用 `ros2 topic pub` 驱动小车走 18 秒（0.1 m/s + 0.3 rad/s），再读取 `/map`。
+
+**结果**：
+
+```
+地图元信息:
+  resolution: 0.05 m/格
+  width: 78, height: 78       ← 3.9m × 3.9m，覆盖整个房间
+
+格子分布（6084 格）:
+  空闲 (0):   5694 格    ← 房间内部，射线穿过
+  占用 (100):  170 格    ← 墙和箱子的可见表面
+  未知 (-1):   219 格    ← 未扫到 / 被遮挡
+```
+
+**结论：建图成功。** 170 个占用格正好对应四面墙 + 箱子的可见表面。
+
+#### ⚠️ AI 在本阶段连续三次误判——全是「验证方法」的锅
+
+| # | 误判 | 真实原因 |
+|---|---|---|
+| 1 | 认为「/map 无数据」 | `grep "^width\|^height"` 配合 `head -3`，把字段截掉了 |
+| 2 | 认为「格子统计为 0」 | `tr "," "\n"` 后每个值带前导空格，`^0$` 无法匹配 |
+| 3 | 认为「slam 没建图」 | `--once` 采样时机 + QoS 读法 |
+
+**三次都不是系统的问题，是检查工具用法的问题。**
+
+> **纪律**：当「检查结果」与「预期」矛盾时，**优先怀疑检查方法**，而不是直接怀疑系统。
+> 这条教训在本课已出现多次（`.rviz` 插件类名、`which xacro`、本处三次）。
+
+#### 地图数值的含义
+
+| 值 | 含义 |
+|---|---|
+| `0` | 空闲（射线穿过，确定无障碍） |
+| `100` | 占用（射线命中，确定有障碍） |
+| `-1` | 未知（未扫描到） |
+
+**SLAM 的本质**：从「哪里打到了东西」反推「哪里是空的、哪里有墙」。
+
+### 现场排障：小车卡在墙边（阶段 6）
+
+**学生报告**：小车卡墙边、倾斜着一直转圈、导致无法建图。
+
+#### AI 复现结果（无头模式实测）
+
+| 测试 | 结果 |
+|---|---|
+| 直冲墙 10 秒（0.5 m/s） | 撞后姿态四元数 `x=-6.6e-06, y=6.4e-06, w≈1` → **完全水平，未翻倒** |
+| 撞后位置 | `x=1.850` → 车头正好贴住墙面（1.95） |
+| 持续顶墙 20 秒（0.3 m/s）后 odom | `x=1.850001` → **无漂移** |
+
+**结论**：物理引擎正常，车只是「贴住墙停住」——真实世界撞墙也会停。
+
+#### 「一直转圈」的可能来源（尚未确认）
+
+1. teleop 按着转向键（`j` / `l`）→ 车贴墙原地转；
+2. RViz 中位姿估计跳变，导致车模型乱转；
+3. 真的翻车（本次未复现）。
+
+#### 为什么卡住会导致「建图失败」
+
+- 车静止 → `/scan` 不变 → SLAM 无新信息 → 地图**停止更新**（已有地图不会丢）；
+- **纯旋转（原地打转）时，2D scan matching 缺少平移约束，容易退化** → 位姿估计漂移 → 地图糊掉。
+
+#### 处理方案
+
+| 场景 | 操作 |
+|---|---|
+| 车贴墙、没翻 | 反向开出来（`linear.x = -0.1`）或重启 launch |
+| 地图已糊 | **重启 slam_toolbox**（清空地图重建） |
+| 预防 | 降速（`teleop` 的 `speed:=0.2 turn:=0.5`）；建图时「边走边转」；撞墙先停车 |
+
+#### 认知升级
+
+仿真里 `diff_drive` 能正确检测「轮子被卡住」（odom 不漂移）；
+**真实世界不会这么理想**——车轮打滑会让编码器继续计数，odom 照样漂。
+这正是阶段 11 要对照的「仿真理想化 vs 真实世界」差异之一。
+
+### 答疑：为什么地图是平面的？（阶段 6）
+
+**学生观察**：RViz 里地图是平面的，没有任何立体东西，墙和方块都显示在平面图上。
+
+**答案：2D SLAM 的地图本来就是二维的，这是物理限制。**
+
+`/map` 的消息类型是 `nav_msgs/OccupancyGrid`：
+
+| 字段 | 含义 |
+|---|---|
+| `width` / `height` | 栅格尺寸（格子数） |
+| `resolution` | 每格多少米 |
+| `data` | 每个格子的值：`0`=空闲、`100`=占用、`-1`=未知 |
+
+**没有高度、没有颜色、没有纹理。**
+
+**为什么**：2D 激光雷达只有**一个扫描平面**（水平面，离地约 13 cm）。
+它测的是「这个方向多远有东西」，**不测「东西多高」**。
+
+```
+侧视图：
+     雷达 ────── 射线（水平）
+      │
+   ───┴──────────────  地面
+```
+
+对 2D 雷达来说，一堵墙、一个箱子、一根柱子——只要在同一个高度上，**看起来都一样**（都是一个「有东西」的距离值）。
+
+**要看立体地图**，需要 3D 传感器（多线激光雷达、深度相机）或 3D SLAM（Cartographer 3D、RTAB-Map）。
+
+**而真实项目的 Camsense 也是 2D 雷达** → 建出来同样是平面的。**这是仿真与实车一致的地方。**
+
+### 撞墙脱困：实测有效
+
+| 步骤 | odom.x |
+|---|---|
+| 前进撞墙（0.5 m/s × 8 s） | 1.850 |
+| 按「,」后退（-0.2 m/s × 3 s） | **1.072** |
+
+**后退能脱困**。teleop 键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止。
+
+### 建图操作要点
+
+**小步走，别长时间按住**：`i` 1 秒 → `k` 停 → `j` 转 → `i` 1 秒 …
+长时间按住 = 高速冲撞 = 撞墙。
+
+---
+
+## 阶段 7 · Nav2 导航
+
+### 成功证据（AI 无头实测）
+
+```
+发目标前: odom.x = 0.016
+发目标后: odom.x = 0.756      ← 车自己走了 0.74 米
+TF 错误: 0
+目标状态: SUCCEEDED
+```
+
+### Nav2 不是一个节点，而是一组服务器
+
+```
+目标点 (map 坐标)
+   ↓
+bt_navigator        ← 行为树：调度整个流程
+   ↓
+planner_server      ← 全局规划（NavFn / A*）
+   ↓
+controller_server   ← 局部控制（DWB / TEB）
+   ↓
+/cmd_vel → 底盘
+
+辅助：
+  map_server   → 加载 /map
+  amcl         → 定位，发布 map → odom
+  global_costmap / local_costmap → 两张代价地图
+  behavior_server → 恢复行为（卡住时后退/旋转）
+  velocity_smoother → 速度平滑
+  lifecycle_manager → 管理所有节点的生命周期
+```
+
+### 两张代价地图（最容易混）
+
+| costmap | 范围 | 用途 |
+|---|---|---|
+| `global_costmap` | 整张地图 | 全局规划（看长远） |
+| `local_costmap` | 车周围几米 | 实时避障（看眼前） |
+
+类比：**全局 = 导航软件的路线图；局部 = 你眼睛看的眼前路况。**
+
+### ⚠️ 本轮踩的两个坑（重要教学点）
+
+#### 坑 1：AMCL 需要初始位姿
+
+**现象**：`/amcl_pose` 不发布，Nav2 报 `AMCL cannot publish a pose... Please set the initial pose`。
+
+**原因**：AMCL 不知道车在地图上的初始位置。
+
+**两种解法**：
+1. **RViz 里点 `2D Pose Estimate`**（标准做法，真实项目必学）
+2. **参数里设**：
+   ```yaml
+   amcl:
+     ros__parameters:
+       set_initial_pose: true
+       initial_pose: {x: 0.0, y: 0.0, z: 0.0, yaw: 0.0}
+   ```
+
+#### 坑 2：AMCL 更新阈值导致「假到达」
+
+**现象**：目标返回 `SUCCEEDED`，但**车一步没动**。
+
+**日志**：
+```
+[ERROR] [tf_help]: Transform data too old when converting from map to odom
+[ERROR] [tf_help]: Data time: 71s, Transform time: 27s   ← TF 落后 44 秒
+[INFO]  [controller_server]: Reached the goal!
+```
+
+**原因链**：
+- AMCL 默认 `update_min_d: 0.25`、`update_min_a: 0.2`
+- **车静止 → 不满足更新条件 → AMCL 不更新位姿 → `map→odom` TF 时间戳停在启动时**
+- controller 拿到**过期 44 秒的 TF** → 算出的"车到目标距离"错误 → **误判已到达**
+
+**解法**：
+```yaml
+amcl:
+  ros__parameters:
+    update_min_d: 0.0
+    update_min_a: 0.0
+    transform_tolerance: 1.0
+```
+
+> **这个坑的价值**：它说明 **TF 不只是"坐标"，还带"时间"**。
+> 时间戳过期的 TF，会让上层算法基于旧世界做决策。
+
+### 关键参数（按我们的车改）
+
+| 参数 | 值 | 为什么 |
+|---|---|---|
+| `robot_radius` | 0.125 | 车的外接圆半径（0.20×0.15 的对角线/2） |
+| `inflation_radius` | 0.30 | 障碍物膨胀距离（默认 0.55 太大，4×4 房间过不去） |
+| `max_vel_x` | 0.26 | 最大线速度 |
+| `update_min_d` / `update_min_a` | 0.0 | AMCL 每帧更新 |
+| `set_initial_pose` | true | 启动时给初始位姿 |
+
+### 启动（三终端）
+
+```bash
+# [终端 A] 仿真
+ros2 launch xuegecar_sim_bringup gazebo.launch.py
+
+# [终端 B] Nav2
+ros2 launch nav2_bringup bringup_launch.py \
+  map:=/home/y/my_map.yaml \
+  params_file:=/home/y/xuegecar_sim_ws/src/xuegecar_sim_bringup/config/nav2_params.yaml \
+  use_sim_time:=true
+
+# [终端 C] RViz
+rviz2 -d ~/xuegecar_sim_ws/src/xuegecar_sim_description/rviz/xuegecar_sim.rviz
+```
+
+**RViz 操作**：Fixed Frame → `map`；Add → Map(`/map`)；Add → Path(`/plan`)；
+用 **2D Goal Pose** 点目标（若 params 已设初始位姿，则不必点 2D Pose Estimate）。
+
+### 坑：RViz 报 "No map received" —— QoS Durability 不匹配（阶段 7）
+
+**实测证据**：
+
+```
+/map 发布者 (map_server):  Reliability: RELIABLE,  Durability: TRANSIENT_LOCAL
+/map 订阅者 (rviz):        Reliability: RELIABLE,  Durability: VOLATILE
+/map 订阅者 (amcl):        Reliability: RELIABLE,  Durability: TRANSIENT_LOCAL
+```
+
+**根因**：`map_server` 以 **TRANSIENT_LOCAL（latched）** 发布地图；
+RViz 的 Map display 默认用 **VOLATILE** 订阅 → **收不到订阅之前已发布的那条消息**。
+而地图很少更新 → RViz 一直收不到 → `No map received`。
+
+**修复（RViz 界面内）**：
+Displays → Map → 展开 `Topic` → **`Durability Policy`：`Volatile` → `Transient Local`** → 地图立刻出现。
+
+#### QoS 兼容规则表（通用，值得记住）
+
+| 发布者 | 订阅者 | 兼容？ | 说明 |
+|---|---|---|---|
+| RELIABLE | RELIABLE | ✅ | 标准 |
+| RELIABLE | BEST_EFFORT | ✅ | 订阅方降级 |
+| **BEST_EFFORT** | **RELIABLE** | ❌ | **连不上** |
+| TRANSIENT_LOCAL | TRANSIENT_LOCAL | ✅ | 能收历史消息 |
+| TRANSIENT_LOCAL | VOLATILE | ⚠️ | 能连，但**收不到历史**（地图/机器人描述类话题的常见坑） |
+| **VOLATILE** | **TRANSIENT_LOCAL** | ❌ | 连不上 |
+
+**判断方法**：
+```bash
+ros2 topic info /话题 -v
+```
+对比发布端 / 订阅端的 `Reliability` 与 `Durability`。**QoS 不匹配时 DDS 静默失败，不报错。**
+
+#### 本课出现过两次同类问题
+
+1. `/robot_description`（RSP → RViz RobotModel）：同样需要 `Transient Local`
+2. `/map`（map_server → RViz Map）：本次
+
+> **规律：凡是「内容不常变、新人来了要能立刻看到」的话题（地图、机器人描述、静态参数），
+> 多半是 latched（TRANSIENT_LOCAL）发布的；订阅端必须也用 TRANSIENT_LOCAL。**
+
+### 坑：RViz 工具栏找不到 `2D Goal Pose`（阶段 7）
+
+**根因**：AI 给的 `.rviz` 配置里，`Visualization Manager → Tools` 只列了
+`MoveCamera / Select / FocusCamera / Measure`，**没有 `SetGoal`**。
+RViz 的工具栏只显示 **配置里声明过的工具** —— 没声明就没有按钮。
+
+**类名**（已用 RViz 插件注册表核实）：
+- `rviz_default_plugins/SetGoal` → 工具栏的 `2D Goal Pose`
+- `rviz_default_plugins/SetInitialPose` → 工具栏的 `2D Pose Estimate`
+
+**修复后的 `.rviz` 关键段**：
+
+```yaml
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic: {Value: /initialpose}
+    - Class: rviz_default_plugins/SetGoal
+      Topic: {Value: /goal_pose}
+```
+
+**同时补齐的显示项**（阶段 7 所需）：
+Grid / RobotModel（Transient Local）/ Map（Transient Local）/ Path（`/plan`）/ LaserScan（Best Effort）
+
+**教训**：`.rviz` 不是"显示配置文件"，它同时**声明了可用工具**。
+换一个 `.rviz` 就等于换了一套工具栏。
+
+### 坑：Nav2 有绿色路径但车不动（阶段 7）
+
+**现象**：用 `2D Goal Pose` 点目标后，RViz 出现绿色路径（`/plan` 有数据），但车一步不动。
+
+#### AI 复现结果（无头模式，远目标）
+
+```
+初始 odom.x = 0.016
+发目标 (1.5, 1.5)
+8 秒后 /cmd_vel: linear.x = 0.26      ← controller 正常发速度
+8 秒后位置: x=1.306, y=1.503         ← 车移动 1.3 米
+```
+
+**结论：Nav2 本身正常。** 问题在「目标点」。
+
+#### 最可能原因：目标离车太近
+
+`xy_goal_tolerance: 0.25` ——
+**目标距离 < 25 cm 时，controller 直接判定「已到达」，不会发任何速度。**
+
+**症状**：
+- 绿色路径极短（甚至看不见）
+- `/cmd_vel` 无数据
+- 任务状态 `SUCCEEDED`
+
+**正确做法**：点一个**远目标**（房间另一头），路径应贯穿地图。
+
+#### 排障顺序（若远目标仍不动）
+
+| # | 检查 | 命令 | 判读 |
+|---|---|---|---|
+| 1 | controller 是否发速度 | `ros2 topic hz /cmd_vel` | 有数据 → 物理层问题 |
+| 2 | AMCL 位姿 | `ros2 topic echo /amcl_pose --once --field pose.pose.position` | 与真实位置差距大 → 定位漂了 |
+| 3 | Nav2 日志 | 看 `Reached the goal!` | 出现 → 误判到达（目标近/TF 旧） |
+| 4 | 旧任务残留 | 重启 Nav2 | 旧任务未结束会挡住新目标 |
+
+#### 判据：什么算「导航成功」
+
+- 绿色路径**从车延伸到目标**（长度合理）
+- `/cmd_vel` 出现非零 `linear.x` / `angular.z`
+- `odom` 位置**持续变化**
+- 最终 `SUCCEEDED`，且车停在目标附近
