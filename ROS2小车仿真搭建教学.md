@@ -2616,3 +2616,39 @@ killall gzserver gzclient
 | 终端 D `[odom=未见]` | 仿真没起或刚起，等 15 秒 |
 | RESET 没反应 | 只在 ESTOP/ERROR 下有效，日志会提示 |
 | 撞墙后动不了 | 先查状态是否仍 TELEOP；按 `,` 后退可脱困（实测 0.69 m） |
+
+#### 8.4 修正：看门狗只在「需要运动」的状态里监控
+
+**问题**（学生实测发现）：只启动 `mission_control`、没起仿真时，5 秒宽限一过就进 ERROR：
+
+```
+state=IDLE 转发=0 拦截=0 [odom=未见 scan=未见]
+IDLE → ERROR
+!!! 看门狗：/odom 已 5.01s 无数据（阈值 0.50s）→ ERROR，已强制零速
+```
+
+**根因不是看门狗写错，是监控范围写宽了。** `IDLE` 是待机态——底盘可能没上电、传感器没插，这些都不该算故障。真正需要数据健康的是「车要动」的时候。
+
+**修法**（3 行）：
+
+```python
+WATCHDOG_ACTIVE_IN = {'TELEOP'}      # 只在工作态监控
+
+def check_links(self):
+    if self.state not in self.WATCHDOG_ACTIVE_IN:
+        return                        # IDLE 待机不查；STOP/ERROR 也不查
+```
+
+**实测**（隔离实例）：
+
+| 场景 | 结果 |
+|---|---|
+| 只起状态机、不起仿真，等 10 秒（远超 5 秒宽限） | 保持 `IDLE`，日志 `[odom=未见 scan=未见]` 但**不报错** ✓ |
+| 随后起仿真 | 仍 `IDLE`，日志变 `[odom=0.00s scan=0.08s]` ✓ |
+| 切 `TELEOP` 后杀 gzserver | `0.57 s` 内 `!!! 看门狗：/odom 已 0.57s 无数据 → ERROR` ✓ |
+| 未恢复时 RESET | 被拒 ✓ |
+| 新实例恢复后 RESET | `ERROR → IDLE` ✓ |
+
+**顺带解决的体验问题**：启动顺序不再敏感。以前「先起状态机、后起仿真」必然 ERROR（Gazebo 要 15 秒才 spawn 完，宽限只有 5 秒）；现在两种顺序都可以。
+
+**留下的问题（8.5 解决）**：如果底盘从未上线，切 `TELEOP` 后仍会立刻 ERROR。更好的做法是**在迁移前做准入检查**——数据不健康就拒绝进入 `TELEOP`，而不是先进去再报错。这是 8.5 迁移表的一部分。
