@@ -2652,3 +2652,54 @@ def check_links(self):
 **顺带解决的体验问题**：启动顺序不再敏感。以前「先起状态机、后起仿真」必然 ERROR（Gazebo 要 15 秒才 spawn 完，宽限只有 5 秒）；现在两种顺序都可以。
 
 **留下的问题（8.5 解决）**：如果底盘从未上线，切 `TELEOP` 后仍会立刻 ERROR。更好的做法是**在迁移前做准入检查**——数据不健康就拒绝进入 `TELEOP`，而不是先进去再报错。这是 8.5 迁移表的一部分。
+
+#### 8.4 加固：多实例防护（学生实测暴露）
+
+**现象**（学生报告三个问题）：① 终端一直显示"数据已恢复，可以 RESET"，按了没用；② RESET 后状态"不对"；③ 按键控制车一顿一顿。
+
+**根因**：`ros2 node list | sort | uniq -c` 显示 **3 个 `/mission_control`**，`/cmd_vel_motor` 有 **3 个发布者**。每次重启都没真正杀掉旧进程（其中一个的 PPID 是 1，已成孤儿）。
+
+| 现象 | 机制 |
+|---|---|
+| 终端一直说"可以 RESET" | 那是卡在 ERROR 的**旧实例**在说话，和你操作的进程不是同一个 |
+| RESET 后状态不对 | `/mission_state` 有 3 个发布者，`echo --once` 随机命中一个 |
+| 按键卡顿 | 一个实例在 ERROR 里 20 Hz 发零速，另一个在 TELEOP 转发速度，**两股流在同一条话题上互相覆盖** |
+
+> 这就是 8.1 要消灭的「多个发布者写同一条速度话题」，以「同一节点多实例」的形式复活。
+> 真机上等价于两个控制器抢方向盘。
+
+**诊断命令**（30 秒定位）：
+
+```bash
+ros2 node list | sort | uniq -c | sort -rn | head
+ros2 topic info /cmd_vel_motor | grep -E "Publisher count|Subscription count"
+```
+
+**加固**：启动 1 秒后自检（等 DDS 发现完成），已有别的发布者就拒绝启动。
+
+```python
+others = self.count_publishers('cmd_vel_motor')   # 注意：把自己也算进去
+if others > 1:
+    self.get_logger().fatal('启动中止：/cmd_vel_motor 上已有 N 个发布者…')
+    raise RuntimeError('duplicate mission_control')
+```
+
+**实测**：起第一个 → 存活、发布者 1；起第二个 → `FATAL 启动中止…` 并退出，发布者仍为 1 ✓
+
+**重启纪律**（写进日常习惯）：
+
+```bash
+ros2 node list | grep mission_control   # 重启前先查，有输出先 pkill -f mission_control
+```
+
+**关终端标签 ≠ 杀进程**：SIGTERM 可能没送达，进程会变孤儿（PPID=1）继续跑。
+
+#### 日志分级语义（学生问「为什么一直是黄色」）
+
+| 状态 | 级别 | 样式 | 含义 |
+|---|---|---|---|
+| ERROR + 数据仍缺 | WARN | 黄 | 故障持续 |
+| ERROR + 数据已恢复 | WARN | 黄 | **仍需人工 RESET**（刻意不自动恢复：故障可能间歇，自动恢复等于让车自己动） |
+| 发 RESET 成功 | INFO | 白 | `ERROR → IDLE`，之后恢复成 `state=IDLE 转发=… [odom=0.0xs]` |
+
+「黄色不变白」不是 bug，是「故障恢复必须有人确认」这条规则的可见形态。
