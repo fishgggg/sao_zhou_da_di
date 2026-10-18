@@ -3301,3 +3301,73 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=cmd_
 |---|---|---|
 | `sim:=true` | ≥25 | Gazebo 要 15 s 才 spawn 完 |
 | `sim:=false` | 3 | 假底盘 1 秒内就发 odom |
+
+### 9.4 namespace：多车隔离
+
+#### 一句话：namespace 隔离**话题**，不隔离 **TF**
+
+给 launch 加 `namespace` 参数，`mission_control` / `fake_chassis` / `robot_state_publisher` 全部推到 `/car1/<节点名>` 下。
+节点内部的**相对名**（`cmd_vel_motor`、`odom`、`scan`、`mission_state`）会自动解析成 `/car1/cmd_vel_motor` 等——**代码一行不用改**。
+
+```bash
+ros2 launch xuegecar_sim_bringup bringup.launch.py sim:=false namespace:=car1 initial_state:=TELEOP grace_period:=3.0
+ros2 launch xuegecar_sim_bringup bringup.launch.py sim:=false namespace:=car2 initial_state:=TELEOP grace_period:=3.0
+```
+
+#### 能隔离 vs 不能隔离
+
+| 东西 | namespace 管用吗 | 说明 |
+|---|---|---|
+| 节点名 | ✅ | `/car1/mission_control`、`/car2/mission_control` |
+| 话题 | ✅ | 相对名自动带前缀 |
+| 服务 / action | ✅ | 同上 |
+| **TF frame** | ❌ | `/tf` 是全局话题，`frame_id` 只是**字符串**，不是话题名 |
+| **Gazebo 实体名** | ❌ | 实体名在 URDF/launch 里硬编码（`xuegecar_sim`），两套仿真会撞名 |
+| Gazebo 插件的话题 | ❌ | 插件在 URDF 里写的 `cmd_vel_motor`、`odom` 是硬编码，namespace 改不动它们 |
+
+**最要命的是 TF**：两个 `fake_chassis` 都在 `/tf` 上发 `odom → base_footprint`，同一个 child frame 有两个发布者 → TF 树互相覆盖，RViz 里车会乱跳。
+
+> 这正是这一步的教学重点：**话题可以随便隔离，坐标系不行。**
+> 坐标系的隔离要在「frame 名字」上做（`car1/odom`、`car2/base_link`），需要改 URDF（xacro 的 `prefix` 参数），
+> 且所有节点、RViz 配置都要跟着改。这是 ROS 2 多机器人（REP-105）的标准做法，但不是加个 namespace 就能得到的。
+
+#### 实测（两套 `sim:=false` 并行）
+
+| 检查 | 结果 |
+|---|---|
+| 节点 | `/car1/*` 与 `/car2/*` 各三个，互不冲突 ✓ |
+| `/car1/mission_state` | `TELEOP` ✓ |
+| `/car2/mission_state` | `TELEOP` ✓ |
+| 发 `/car1/cmd_vel_teleop 0.3` | `car1 odom.x: 0.0 → 1.206`，**`car2 odom.x: 0.0`（纹丝不动）** ✓ |
+| `/car1/cmd_vel_motor` 发布者 | 1（自己的 mission_control）✓ |
+| `/car2/cmd_vel_motor` 发布者 | 1 ✓ |
+
+**注意第 4 行**：这正是多实例自检（8.4 加固）在起作用——但这次是「每车一个」，不是「错误的多实例」。
+因为自检用的是相对名 `count_publishers('cmd_vel_motor')`，在 `/car1` 命名空间下只看得到 `/car1/cmd_vel_motor`。
+
+#### 操作流程
+
+```bash
+# 车 1
+ros2 launch xuegecar_sim_bringup bringup.launch.py sim:=false namespace:=car1 initial_state:=TELEOP grace_period:=3.0
+
+# 车 2（另一个终端）
+ros2 launch xuegecar_sim_bringup bringup.launch.py sim:=false namespace:=car2 initial_state:=TELEOP grace_period:=3.0
+
+# 分别遥控（话题要带前缀）
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/car1/cmd_vel_teleop
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/car2/cmd_vel_teleop
+
+# 分别观察
+ros2 topic echo /car1/mission_state --once
+ros2 topic echo /car2/mission_state --once
+```
+
+#### 想真正多车怎么办（留给后续）
+
+1. URDF 加 `prefix`：`car1/base_link`、`car1/odom`……（xacro 参数）
+2. RViz 每车一个实例，Fixed Frame 各自指向 `car1/odom`
+3. 仿真用两套独立 `GAZEBO_MASTER_URI`（就像我测试时用的 11399/11400）
+4. Nav2/SLAM 每车一套，各自的 `map` 也要加前缀
+
+**这不是 9.4 要完成的事**，9.4 的产出是「知道边界在哪」——比「会用参数」更值钱。
