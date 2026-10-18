@@ -2985,3 +2985,38 @@ def _warn_if_fake_success(self):
 | amcl (1.15, 0.95)，目标 (1.20, 1.00) | 静默（正常到达）✓ |
 
 **判据**：以后看到「导航中：剩余 0.00 m」后立刻成功，且终端 D 出现「疑似假成功」，直接重启 Nav2，不要怀疑状态机。
+
+#### ⚠️ 清理 Nav2 的坑：`pkill nav2_bringup` 杀不干净
+
+**现象**：全杀之后 `ros2 node list | grep -c controller_server` 仍是 1。
+
+**原因**：Nav2 的节点不跑在 `nav2_bringup` 进程里。
+
+```
+ros2 launch nav2_bringup bringup_launch.py        ← pkill -f nav2_bringup 只能杀这一层
+  └── component_container_isolated                ← 名字里没有 "nav2"，杀不到
+        └── controller_server / planner_server / bt_navigator / amcl / map_server
+            （全部跑在这一个进程内部）
+```
+
+杀掉 launch 后，容器进程变孤儿继续跑，节点照常在线。实测抓到一个 **17 分钟**的孤儿容器——正是之前 `Failed to make progress` 的实例，「假成功」的元凶。
+
+**正确的清理顺序**：
+
+```bash
+killall gzserver gzclient 2>/dev/null
+pkill -f "nav2_bringup"
+pkill -f "component_container"      # ← 关键，漏了它等于没杀 Nav2
+pkill -f "mission_control"
+sleep 5
+```
+
+**验证（三条都要是 0）**：
+
+```bash
+ros2 node list | wc -l                      # 0
+ros2 node list | grep -c controller_server   # 0
+ps -eo args | grep -c "[c]omponent_container"  # 0
+```
+
+> `ros2 node list` 走 DDS 发现，节点退出后 graph 要几秒才更新。**杀完等 5~10 秒再看**，否则会把缓存当残留、或把残留当缓存。
