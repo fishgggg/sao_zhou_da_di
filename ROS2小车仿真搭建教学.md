@@ -3206,3 +3206,98 @@ ros2 node list | grep 节点名      # 3. 是不是多个实例，读到的是�
 | 参数有值但行为不对 | 才是真正的代码逻辑问题 |
 
 **结论：改完参数，第一件事永远是 `ros2 param get` 确认它真的被节点认领了。**
+
+### 9.3 仿真实车切换：`sim:=true/false`
+
+#### 核心命题
+
+**状态机不关心速度从哪来。** 它只认四个接口：
+
+```
+        ┌──────────── 状态机 mission_control ────────────┐
+/odom   │ 看门狗（数据健康）                              │
+/scan ──┤                                                │
+        │  分权表：TELEOP/MAPPING ← /cmd_vel_teleop      │
+        │          NAVIGATING     ← /cmd_vel             │
+        └───────────────┬────────────────────────────────┘
+                        │ /cmd_vel_motor（唯一出口）
+                        ▼
+                  底盘（谁提供都行）
+```
+
+**换底盘 = 换 launch 的一个开关，`mission_control` 一行不改。** 这不是口号，是实测过的。
+
+#### 假底盘：`fake_chassis`
+
+阶段 9.3 新增一个节点，专门扮演「底盘驱动」：
+
+| 职责 | fake_chassis 的做法 | Gazebo 的做法 | 实车的做法 |
+|---|---|---|---|
+| 收速度 | 订阅 `/cmd_vel_motor` | 差速插件订阅 | 驱动节点订阅，写串口/CAN |
+| 出里程计 | 差速运动学积分 | 物理引擎算轮子转角 | 编码器/IMU 积分 |
+| 出 TF | 发 `odom→base_footprint` | 插件发 | 驱动节点发 |
+| 出雷达 | 按房间几何算射线 | Gazebo 射线传感器 | 真实雷达驱动 |
+
+**假底盘的局限（必须记住）**：纯数学积分，没有物理、没有碰撞检测，车不会真的被墙挡住。
+**只能验证链路与状态机，不能用于导航**（Nav2 会以为能穿墙）。
+
+#### launch 的切换逻辑
+
+```python
+gazebo = IncludeLaunchDescription(..., condition=IfCondition(sim))
+rsp    = Node(robot_state_publisher, ..., condition=UnlessCondition(sim))
+chassis= Node(fake_chassis,          ..., condition=UnlessCondition(sim))
+mission= Node(mission_control)        # 两种模式都起，参数完全相同
+```
+
+> 为什么非仿真分支要自己起 RSP：`gazebo.launch.py` 把 RSP 和 Gazebo 绑在了一个文件里。
+> 抽出来会更干净（阶段 9.4 可做），但现在复制 10 行换取「不改动已验证文件」更划算。
+
+#### 实测记录（`sim:=false`）
+
+```bash
+ros2 launch xuegecar_sim_bringup bringup.launch.py \
+  sim:=false initial_state:=TELEOP grace_period:=3.0
+```
+
+| 检查 | 结果 |
+|---|---|
+| 节点 | `fake_chassis` + `mission_control` + `robot_state_publisher`（3 个，无 Gazebo）✓ |
+| 状态 | `TELEOP` ✓ |
+| TELEOP 下发 `/cmd_vel_teleop 0.3` | `odom.x: 0.0 → 1.242`（走 1.24 m）✓ |
+| `/scan` | 有数据 ✓ |
+| 看门狗 | 无 ERROR（`grace_period:=3` 足够，因为假底盘秒起）✓ |
+
+**同一条命令只改 `sim:=true`，就是 Gazebo 仿真；状态机日志一字不差。**
+
+#### 实车怎么接（下一步的地图）
+
+把 `sim:=false` 分支里的 `fake_chassis` 换成真实驱动节点即可，接口完全不变：
+
+| 你的底盘 | 驱动节点要做的事 |
+|---|---|
+| 串口 MCU（如 ESP32） | 订阅 `/cmd_vel_motor` → 发速度帧；读编码器 → 发 `/odom` + TF |
+| CAN 电机驱动器 | 同上，协议换 CAN |
+| 已有 ROS 2 底盘包 | 通常自带 `/odom` 和 `/cmd_vel`，只需把它的 `cmd_vel` remap 成 `cmd_vel_motor` |
+
+**判据**：`ros2 topic info /cmd_vel_motor` 的订阅者从 `diff_drive` 变成你的驱动节点，其余一切照旧。
+
+#### 操作流程
+
+```bash
+# 模式 A：Gazebo 仿真（默认）
+ros2 launch xuegecar_sim_bringup bringup.launch.py
+ros2 launch xuegecar_sim_bringup bringup.launch.py initial_state:=TELEOP grace_period:=25.0
+
+# 模式 B：假底盘（无 Gazebo，验证抽象层 / 只调状态机逻辑）
+ros2 launch xuegecar_sim_bringup bringup.launch.py \
+  sim:=false initial_state:=TELEOP grace_period:=3.0
+
+# 两种模式都要的遥控（不变）
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=cmd_vel_teleop
+```
+
+| 模式 | grace_period | 原因 |
+|---|---|---|
+| `sim:=true` | ≥25 | Gazebo 要 15 s 才 spawn 完 |
+| `sim:=false` | 3 | 假底盘 1 秒内就发 odom |
