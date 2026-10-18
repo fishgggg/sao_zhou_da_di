@@ -3071,3 +3071,99 @@ t+8s  IDLE        odom.x=1.3514
 2. `ros2 topic echo /amcl_pose --once` → 位姿合理？
 3. `ros2 topic echo /plan --once` → 终点等于目标？
 4. 以上都对 → **查 goal_checker 的 `stateful`**，改 false 并**重启** Nav2
+
+---
+
+## 阶段 9 · 启动整合与参数化
+
+### 痛点（学生前 8 阶段反复遇到）
+
+| 负担 | 以前的做法 |
+|---|---|
+| 每次开 4 个终端 | 仿真 / 状态机 / 遥控 / 命令各一个 |
+| 每次重启状态机都要手切 TELEOP | 忘了就以为「车坏了」 |
+| 仿真和实车命令完全不同 | 两套启动方式 |
+| 两套仿真相撞 | 话题全叫 `/cmd_vel` |
+
+四步：**9.1 一条命令起全套 → 9.2 参数化 → 9.3 `sim:=true/false` → 9.4 namespace**。
+本次完成 9.1 + 9.2。
+
+### 9.1 一条命令起全套
+
+新增 `xuegecar_sim_bringup/launch/bringup.launch.py`：
+
+```
+bringup.launch.py
+├── include gazebo.launch.py   → gzserver/gzclient + RSP + spawn
+└── node mission_control       → 状态机
+```
+
+**没有复制 `gazebo.launch.py` 的任何逻辑**，用 `IncludeLaunchDescription` 复用。这样世界文件、spawn 时机这些细节只有一处。
+
+```bash
+ros2 launch xuegecar_sim_bringup bringup.launch.py
+```
+
+### 9.2 参数化：`initial_state`
+
+状态机新增参数 `initial_state`（默认 `IDLE`）：
+
+```python
+self.declare_parameter('initial_state', 'IDLE')
+...
+init = str(self.get_parameter('initial_state').value).strip().upper()
+if init in self.STATES and init not in self.STICKY:
+    self.state = init
+else:
+    self.get_logger().warn(f'initial_state={init!r} 不合法…回退 IDLE')
+```
+
+**为什么拒绝 `ESTOP` / `ERROR`**：这两个是粘性状态，只能由事件（急停命令 / 看门狗）触发。允许用参数启动进去，等于给了一个「开机即故障」的后门。
+
+**必须同时参数化 `grace_period`**：`initial_state:=TELEOP` 时，看门狗在 5 秒宽限后就会检查数据，而 Gazebo 要 6 秒才 spawn 完——必然误判 ERROR。所以：
+
+```bash
+ros2 launch xuegecar_sim_bringup bringup.launch.py initial_state:=TELEOP grace_period:=25.0
+```
+
+### 参数表
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `gui` | `true` | 是否开 Gazebo 界面 |
+| `world` | `room.world` | 世界文件 |
+| `initial_state` | `IDLE` | 启动状态；非 IDLE 时宽限要加大 |
+| `grace_period` | `5.0` | 看门狗启动宽限（秒） |
+
+### 实测记录（隔离实例）
+
+| 检查 | 结果 |
+|---|---|
+| 一条命令起全套 | `spawn=1`，节点 `mission_control` + `diff_drive` ✓ |
+| `initial_state:=TELEOP` | `/mission_state` = `TELEOP` ✓ |
+| `grace_period:=25.0` | 25 秒后仍是 `TELEOP`，没有误进 ERROR ✓ |
+| TELEOP 下发 `/cmd_vel_teleop 0.3` | `odom.x: 0.0084 → 1.3409`（走 1.33 m）✓ |
+
+> 注意：`initial_state:=TELEOP` 只是省掉「手切」这一步，**遥控器仍需带 remap 启动**
+> （`--ros-args -r cmd_vel:=cmd_vel_teleop`），因为分权表没变。
+
+### 完整操作流程（阶段 9 版，两个终端就够）
+
+```bash
+# [终端 A] 一条命令起仿真 + 状态机（默认 IDLE）
+ros2 launch xuegecar_sim_bringup bringup.launch.py
+
+# 或者：直接进遥控态（宽限一起加大）
+ros2 launch xuegecar_sim_bringup bringup.launch.py initial_state:=TELEOP grace_period:=25.0
+
+# [终端 C] 遥控（必须 remap）
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=cmd_vel_teleop
+
+# [终端 X] 只在需要发命令/查状态时开
+ros2 topic echo /mission_state --once
+```
+
+**判据**：
+1. 终端 A：`Successfully spawned entity` + `mission_control 启动：state=…`
+2. `ros2 node list` 同时有 `mission_control` 和 `diff_drive`
+3. 若 `initial_state:=TELEOP`，`/mission_state` 直接是 `TELEOP`，按 `i` 就能走
