@@ -2400,3 +2400,215 @@ d_right = θ_right · r
 | `wheel_radius` | 0.0325 m | 线速度 ↔ 轮转速的换算 |
 | `wheel_separation` | 0.17 m | 直行 ↔ 转弯的分配（W 越小转得越急） |
 | `update_rate` | 50 Hz | 插件多久算一次、发一次 odom |
+
+---
+
+### 8.4 看门狗：系统自己坏了怎么办
+
+#### 核心认知：ROS 里「没有消息」不会触发任何回调
+
+订阅回调只在**有消息**时执行。所以「多久没收到」这件事，**订阅端是感知不到的**——必须另设一个定时器，自己拿表去比：
+
+```python
+# 有消息时只做一件事：记下时刻
+def on_odom(self, msg):
+    self.last_rx['odom'] = time.monotonic()
+
+# 定时器（10 Hz）负责判断「多久没收到」
+def check_links(self):
+    now = time.monotonic()
+    for name in self.MONITORED:
+        age = now - self.last_rx.get(name, self.start_time)
+        if age > self.timeouts[name]:
+            self._set_state('ERROR')
+```
+
+这就是看门狗与普通订阅的本质差别：**普通订阅是「事件驱动」，看门狗是「时间驱动」**。
+
+#### 三个设计决定
+
+| 决定 | 实现 | 为什么 |
+|---|---|---|
+| 超时进 `ERROR`，不是 `ESTOP` | `STATES += 'ERROR'`，`SAFETY_HOLD` 扩成 `{'ESTOP','ERROR'}` | 语义不同：ESTOP 是人叫停，ERROR 是故障。日志、复位条件、外部 UI 都应该区分 |
+| 故障未消除时拒绝 `RESET` | `faults_cleared()` 检查每个源最近是否有数据 | 否则「复位 → 立刻超时 → ERROR」来回抖，人永远不知道什么时候真的好了 |
+| 启动宽限期 5 秒 | `now - start_time < grace` 时直接返回 | 刚启动还没收到数据是正常的，否则一启动就 ERROR |
+
+**数据恢复后不自动回 IDLE**，这一点是刻意的：故障可能是间歇性的（接触不良、DDS 偶发丢包），自动恢复会让车「自己开始动」。必须人工确认后 `RESET`。
+
+#### 参数（可调，不用改代码）
+
+| 参数 | 默认 | 依据 |
+|---|---|---|
+| `odom_timeout` | 0.5 s | odom 50 Hz（20 ms/帧）→ 0.5 s = 丢 25 帧 |
+| `scan_timeout` | 1.0 s | 雷达 10 Hz（100 ms/帧）→ 1.0 s = 丢 10 帧 |
+| `grace_period` | 5.0 s | 覆盖 Gazebo 启动 + spawn 的时间 |
+
+调法：`--ros-args -p odom_timeout:=1.0`。
+
+#### 实测证据（两轮）
+
+**第一轮：SIGSTOP 冻结 gzserver**
+
+| 步骤 | 观测 |
+|---|---|
+| 宽限期后 | `state=IDLE`，日志 `[odom=0.01s scan=0.07s]` → **不误报** ✓ |
+| `kill -STOP` 冻结 | `!!! 看门狗：/odom 已 0.57s 无数据（阈值 0.50s）→ ERROR，已强制零速` ✓ |
+| 零速帧率 | 日志 2 秒内 47 → 87 帧 = **20 Hz** ✓ |
+| 数据未恢复时 RESET | `拒绝复位：故障未消除 —— /odom（0.5s 内无数据）、/scan（1.0s 内无数据）` ✓ |
+| `kill -CONT` 解冻 | 日志 `state=ERROR 数据已恢复，可以 RESET` ✓ |
+| 恢复后 RESET | `ERROR → IDLE` ✓ |
+| **解冻后发 0.3 m/s** | **x: 0.0091 → 0.0106（只有 1.5 mm）——车没动** ⚠️ |
+
+**第二轮：起一个新 gazebo 实例（新 master 端口 11400），模拟「底盘重启」**
+
+| 步骤 | 观测 |
+|---|---|
+| 基线 TELEOP 发 0.3 | `x: 0.0048 → 1.6979`（1.69 m）✓ |
+| 杀掉 gzserver | `!!! 看门狗：/odom 已 0.56s 无数据 → ERROR，已强制零速` ✓ |
+| 未恢复时 RESET | 保持 `ERROR` ✓ |
+| 新 gazebo 起来（spawn=1） | 状态**仍 ERROR**（不自动恢复）✓ 日志 `数据已恢复，可以 RESET` |
+| 恢复后 RESET | `ERROR → IDLE` ✓ |
+| 再 TELEOP 发 0.3 | `x: 0.0057 → 1.5008`（**1.50 m，车真的能动**）✓ |
+
+**结论：产品逻辑（超时→ERROR→拒复位→恢复→复位→能动）全部成立。**
+
+#### ⚠️ 又一次「观测手段本身污染结论」（第三次了）
+
+第一轮用 SIGSTOP 冻结仿真，逻辑全对，但最后一步「车能不能动」测出来是 1.5 mm——差点据此写下「恢复后车动不了」这个假结论。
+
+差异说明问题不在产品逻辑：**第二轮换成「杀掉 gzserver，再起一个全新实例」，同样的代码路径，车走了 1.5 米。**
+
+真实原因（未深究到底层）：SIGSTOP/SIGCONT 让 Gazebo 的仿真时钟与物理线程停顿了几秒，恢复瞬间 `dt` 异常大，差速插件的速度积分被带偏。**这是测试脚手架的副作用，不是被测代码的缺陷。**
+
+教训：**测「恢复后能否工作」时，要用真实的恢复方式（重启进程），不要用暂停/继续这种非真实操作。** 前两次分别是「撞墙污染急停观测」「按键未进 raw 模式」，这是第三次——手法不同，根因同一个：**验证装置和被测对象共享了状态**。
+
+#### 学生验证（5 步）
+
+```bash
+# [终端 A] 仿真    [终端 D] 重启一次状态机（旧进程加载的是 8.3 代码）
+ros2 run xuegecar_sim_mission mission_control
+# [终端 X] 切 TELEOP
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
+
+# ① 正常时不该报错：等 10 秒，看终端 D 的 [odom=…s scan=…s] 都接近 0
+# ② 制造故障：把 Gazebo 窗口关掉，或另开终端 killall gzserver
+#    判据：2 秒内终端 D 出现「!!! 看门狗：/odom 已 0.5xs 无数据 → ERROR」
+# ③ 此时 RESET —— 应被拒绝，并列出 /odom、/scan 都无数据
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: RESET}"
+# ④ 重启仿真（终端 A 重新 ros2 launch …）
+#    判据：状态仍是 ERROR（不会自己恢复），日志变成「数据已恢复，可以 RESET」
+# ⑤ 再 RESET —— 这次成功回 IDLE；切 TELEOP 后按 i 车能动
+```
+
+#### 判据表
+
+| 现象 | 含义 |
+|---|---|
+| 正常时日志 `[odom=0.0xs scan=0.0xs]` | 数据健康，看门狗在正常巡检 |
+| 2 秒内变 ERROR 并打印超时源 | 看门狗工作 |
+| RESET 被拒且列出无数据的源 | 故障未消除保护生效 |
+| 数据恢复后仍 ERROR | 不自动恢复，等人确认 |
+| 数据恢复后 RESET 成功 → 能动 | 全链路闭环 |
+
+---
+
+## 附录：WSL 重启后的完整恢复与验收流程
+
+> 适用场景：`wsl --shutdown` 或关机重开之后，从零把系统跑起来并验收 8.1-8.4。
+> 前提：`~/xuegecar_sim_ws/install` 已存在（编译产物在磁盘上，重启不丢），**不需要重新 build**。
+
+### 0. 启动 WSL
+
+开始菜单搜 Ubuntu / Windows Terminal 选 Ubuntu / `wsl` 回车。
+
+**判据**：出现 `y@主机名:~$`。
+
+### 1. 环境自检
+
+```bash
+echo $ROS_DISTRO                          # 应为 humble
+ls ~/xuegecar_sim_ws/install | grep xuegecar
+```
+
+**判据**：`humble` + 三个包（description / bringup / mission）。
+`~/.bashrc` 的 L120/L122 已自动 source ROS 与工作区，正常终端不需要手动 source；若 `$ROS_DISTRO` 为空，执行 `source ~/.bashrc`。
+
+### 2. 开四个终端
+
+| 终端 | 职责 |
+|---|---|
+| A-仿真 | `ros2 launch xuegecar_sim_bringup gazebo.launch.py` |
+| D-状态机 | `ros2 run xuegecar_sim_mission mission_control` |
+| C-遥控 | `ros2 run teleop_twist_keyboard teleop_twist_keyboard` |
+| X-命令 | 发 `/mission_command`、查话题 |
+
+### 3. 启动顺序与判据
+
+| 步 | 终端 | 命令 | 判据 |
+|---|---|---|---|
+| 1 | A | `ros2 launch xuegecar_sim_bringup gazebo.launch.py` | Gazebo 窗口 + `Successfully spawned entity` |
+| 2 | D | `ros2 run xuegecar_sim_mission mission_control` | `看门狗已启用…` + `state=IDLE … [odom=0.01s scan=0.07s]` |
+| 3 | C | `ros2 run teleop_twist_keyboard teleop_twist_keyboard` | 打印键位表 |
+
+> 终端 D 看不到 `看门狗已启用` = 跑的是旧代码 → `cd ~/xuegecar_sim_ws && colcon build --packages-select xuegecar_sim_mission`
+
+### 4. 验收 8.1（闸门）
+
+```bash
+ros2 topic info /cmd_vel_motor -v | grep -E "count|Node name"
+```
+
+**判据**：发布者 1 = `mission_control`；订阅者 1 = `diff_drive`。
+
+### 5. 验收 8.2（拦截/放行）
+
+| 步 | 操作 | 判据 |
+|---|---|---|
+| 1 | 确认 `ros2 topic echo /mission_state --once` = `IDLE` | — |
+| 2 | 终端 C 按 `i` | 车**不动**，`拦截=` +1 |
+| 3 | `{data: TELEOP}` | 日志 `IDLE → TELEOP` |
+| 4 | 终端 C 按 `i` | 车动，`转发=` 上涨 |
+| 5 | 终端 C 按 `k` | 车停住 |
+
+### 6. 验收 8.3（急停）
+
+| 步 | 操作 | 判据 |
+|---|---|---|
+| 1 | 按 `i` 走 1 秒，车还在走时发 `{data: ESTOP}` | ~0.5 s 内停住（0.5 m/s ÷ 1.0 m/s²），多走约 12 cm；日志 `!!! 急停` |
+| 2 | 按 `i` | 不动，`拦截=` 增长 |
+| 3 | 发 `{data: TELEOP}` | 被拒（`ESTOP 是粘性状态`），状态仍 ESTOP |
+| 4 | 发 `{data: RESET}` | `ESTOP → IDLE` |
+| 5 | 按 `i` | 不动（IDLE 不放行） |
+| 6 | 发 `{data: TELEOP}` | 能动 |
+
+### 7. 验收 8.4（看门狗）
+
+| 步 | 操作 | 判据 |
+|---|---|---|
+| 1 | 等 10 秒 | 不是 ERROR，`[odom=0.0xs scan=0.0xs]` |
+| 2 | 关 Gazebo 窗口 / `killall gzserver` | 2 秒内 `!!! 看门狗：/odom 已 0.5xs 无数据 → ERROR` |
+| 3 | 发 `{data: RESET}` | 被拒，列出 `/odom`、`/scan` |
+| 4 | 终端 A 重新 launch，等 20 秒 | 状态**仍 ERROR**，日志 `数据已恢复，可以 RESET` |
+| 5 | 发 `{data: RESET}` | `ERROR → IDLE` |
+| 6 | 切 `TELEOP`，按 `i` | 能动（实测恢复后走 1.50 m） |
+
+### 8. 收尾
+
+```bash
+killall gzserver gzclient
+```
+
+**直接关终端窗口会留孤儿 gzserver，下次启动报 `Address already in use`。**
+
+### 故障速查
+
+| 现象 | 处理 |
+|---|---|
+| `ros2: command not found` | `source ~/.bashrc` |
+| `Package 'xuegecar_sim_mission' not found` | 同上 |
+| 按 `i` 不动且 `转发` 不涨 | 状态不是 TELEOP |
+| 按 `i` 不动但 `转发` 在涨 | 查 `/cmd_vel_motor` 订阅者是否 `diff_drive` |
+| `Address already in use` | `killall gzserver` 等 3 秒再起 |
+| 终端 D `[odom=未见]` | 仿真没起或刚起，等 15 秒 |
+| RESET 没反应 | 只在 ESTOP/ERROR 下有效，日志会提示 |
+| 撞墙后动不了 | 先查状态是否仍 TELEOP；按 `,` 后退可脱困（实测 0.69 m） |
