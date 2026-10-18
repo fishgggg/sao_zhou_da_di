@@ -3167,3 +3167,42 @@ ros2 topic echo /mission_state --once
 1. 终端 A：`Successfully spawned entity` + `mission_control 启动：state=…`
 2. `ros2 node list` 同时有 `mission_control` 和 `diff_drive`
 3. 若 `initial_state:=TELEOP`，`/mission_state` 直接是 `TELEOP`，按 `i` 就能走
+
+#### ⚠️ 「传了参数但没效果」——先 `ros2 param get`
+
+**现象**：用 `initial_state:=TELEOP` 启动，状态却是 `IDLE`，遥控按 `i` 不动。
+
+**取证**（两条命令定位）：
+
+```bash
+ros2 param get /mission_control initial_state
+# → Parameter not set          ← 节点里根本没有这个参数
+
+ros2 param get /mission_control grace_period
+# → Double value is: 5.0       ← 旧代码的默认值
+```
+
+**根因**：启动的 `mission_control` 是**旧代码**（`initial_state` 参数是阶段 9 才加的），
+launch 把 `initial_state:=TELEOP` 传给一个不声明该参数的节点——**不报错、不警告、静默忽略**。
+节点用硬编码的 `IDLE` 启动，于是 IDLE 不放行速度，按 `i` 毫无反应。
+
+**为什么 ROS 2 会静默**：节点默认允许未声明参数（`allow_undeclared_parameters` 相关），
+未声明的参数只是躺在参数服务器上没人读。这是宽容设计的代价。
+
+**排查顺序**（以后「参数无效」照这个走）：
+
+```bash
+ros2 param get /节点名 参数名     # 1. 参数存在吗？not set = 旧代码 / 拼错 / 没重启
+ros2 param list /节点名 | grep 关键词   # 2. 实际有哪些参数
+ros2 node list | grep 节点名      # 3. 是不是多个实例，读到的是另一个
+```
+
+**同一族的坑**（本质都是「参数系统只报告、不保证」）：
+
+| 现象 | 真相 |
+|---|---|
+| `ros2 param set` 返回 successful，行为没变 | 插件在 configure 时读过一次成员变量，之后不再读（`stateful` 那次） |
+| 传了 `initial_state:=TELEOP`，启动仍是 IDLE | 节点没声明该参数，静默忽略（本次） |
+| 参数有值但行为不对 | 才是真正的代码逻辑问题 |
+
+**结论：改完参数，第一件事永远是 `ros2 param get` 确认它真的被节点认领了。**
