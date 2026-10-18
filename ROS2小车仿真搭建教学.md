@@ -2941,3 +2941,47 @@ ros2 topic pub --once /mission_command std_msgs/msg/String "{data: IDLE}"
 
 - ✅ 好目标：`(1.2, 1.0)`、`(1.5, 1.5)`、`(0.5, -1.5)`——离墙 ≥0.4 m，避开箱子
 - ❌ 坏目标：`(0, 0)`（原地，`xy_goal_tolerance` 直接判到达）、`(1.9, 0)`（贴墙）
+
+#### 8.6 加固：识别「假成功」
+
+**学生实测**：发目标 (1.2, 1.0) 后日志是
+
+```
+收到目标 (1.20, 1.00)，开始导航
+IDLE → NAVIGATING（听=nav）
+目标已被接受，开始执行
+导航中：剩余 0.00 m
+导航成功 → IDLE          ← 从接受到成功只隔 62 ms，车一步没动
+```
+
+**逐步排除**（每次都用工具取证，不猜）：
+
+| 假设 | 检查 | 结果 |
+|---|---|---|
+| 目标就在车脚下 | `amcl_pose` = (0.086, 0.000)，目标 (1.2, 1.0)，距离 1.5 m | ❌ 排除 |
+| Nav2 没收到正确坐标 | 绕过 mission 直接 `ros2 action send_goal` | `distance_remaining=1.9485` → Nav2 侧正常 ❌ |
+| mission 构造 goal 传参错 | 探针复现 `goal.pose = msg` 后读值 | `x=1.2`，Nav2 收到 1.9485 → 传参正确 ❌ |
+| 多实例 | `node list` 去重 | 各 1 个 ❌ |
+| **Nav2 实例状态异常** | 直接 send_goal：车没动却在 3.9 s 内 `SUCCEEDED` | ✅ **成立** |
+
+根因：Nav2 在之前 `Failed to make progress` / abort 之后，behavior tree 残留异常状态，收到新目标会在第一个 tick 就判定到达。
+
+**加固**：成功时用 AMCL 位姿与目标核对，差太远就报警。
+
+```python
+def _warn_if_fake_success(self):
+    d = math.hypot(self.amcl_xy[0] - self._nav_goal_xy[0],
+                   self.amcl_xy[1] - self._nav_goal_xy[1])
+    if d > 0.8:
+        self.get_logger().warn(f'⚠️ 疑似假成功：… 距目标还有 {d:.2f} m。'
+                               f'通常是 Nav2 实例状态异常，重启 Nav2 再试。')
+```
+
+实测（直接调方法）：
+
+| 输入 | 输出 |
+|---|---|
+| amcl (0.10, 0.00)，目标 (1.20, 1.00) | `⚠️ 疑似假成功 … 还有 1.49 m` ✓ |
+| amcl (1.15, 0.95)，目标 (1.20, 1.00) | 静默（正常到达）✓ |
+
+**判据**：以后看到「导航中：剩余 0.00 m」后立刻成功，且终端 D 出现「疑似假成功」，直接重启 Nav2，不要怀疑状态机。
