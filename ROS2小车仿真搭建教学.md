@@ -3020,3 +3020,54 @@ ps -eo args | grep -c "[c]omponent_container"  # 0
 ```
 
 > `ros2 node list` 走 DDS 发现，节点退出后 graph 要几秒才更新。**杀完等 5~10 秒再看**，否则会把缓存当残留、或把残留当缓存。
+
+#### ✅ 8.6 真正的根因：`stateful: true`（已修）
+
+**现象**：发目标后 60 ms 内报 `SUCCEEDED`，`剩余 0.00~2.50 m` 后立刻成功，车一步不动。
+
+**排除过程**（每步都有证据）：
+
+| 检查 | 结果 | 结论 |
+|---|---|---|
+| `amcl_pose` | (0.047, 0.000) | 车确实在原点，目标在 1.9 m 外 ❌ 不是「目标在脚下」 |
+| `/plan` | 194 个点，终点 **(1.500, -1.200)** | 规划完全正确 ❌ 不是 planner |
+| `ros2 action info /navigate_to_pose` | `Action servers: 1` | Nav2 在线 ❌ |
+| mission 传参 | 探针复现 `goal.pose = msg` → Nav2 收到 `distance_remaining=1.9485` | 传参正确 ❌ |
+| `xy_goal_tolerance` | 0.25 | 正常 ❌ |
+| **`general_goal_checker.stateful`** | **true** | ✅ **命中** |
+
+**机制**：Nav2 的 `SimpleGoalChecker` 在 `stateful: true` 时，一旦判定过「到达」就把状态保持住，
+后续检查直接返回 true，直到被 `reset()`。而 controller_server 在新目标时**不一定 reset**。
+结果是：**成功导航过第一次之后，之后所有目标都立即「成功」**——完全对得上「之前能走，后来全是假成功」。
+
+**修复**（`config/nav2_params.yaml` 两处）：
+
+```yaml
+general_goal_checker:
+  stateful: false     # 原为 true
+```
+
+> ⚠️ **必须重启 Nav2 才生效**。`ros2 param set` 动态改参数返回 "successful"，
+> 但插件实例的 `stateful_` 成员是在 configure 时读的，不会更新。本次实测：
+> 动态改成 false 后仍假成功，重启 Nav2 后正常。
+
+**修复后实测**：
+
+```
+t+2s  NAVIGATING  odom.x=1.0036
+t+4s  NAVIGATING  odom.x=1.3529
+t+6s  IDLE        odom.x=1.3523
+t+8s  IDLE        odom.x=1.3514
+```
+
+一次走 1.28 m，走完才回 IDLE ✓
+
+**教训**：`stateful` 这个名字听起来无害（「记住状态」），实际语义是「到达后永远认为到达」。
+**只在明确需要「同一目标重复检查」的场景才开**，普通导航一律 false。
+
+#### 排查顺序（以后遇到假成功照这个走）
+
+1. `ros2 action info /navigate_to_pose` → `Action servers: 1`？
+2. `ros2 topic echo /amcl_pose --once` → 位姿合理？
+3. `ros2 topic echo /plan --once` → 终点等于目标？
+4. 以上都对 → **查 goal_checker 的 `stateful`**，改 false 并**重启** Nav2
