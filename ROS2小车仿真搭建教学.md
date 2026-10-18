@@ -2703,3 +2703,93 @@ ros2 node list | grep mission_control   # 重启前先查，有输出先 pkill -
 | 发 RESET 成功 | INFO | 白 | `ERROR → IDLE`，之后恢复成 `state=IDLE 转发=… [odom=0.0xs]` |
 
 「黄色不变白」不是 bug，是「故障恢复必须有人确认」这条规则的可见形态。
+
+---
+
+### 8.5 迁移表与速度源分权
+
+前四步解决了「怎么停」，这一步解决「谁能开、听谁的」。
+
+#### 七个状态
+
+| 状态 | 语义 | 听哪个速度源 |
+|---|---|---|
+| `IDLE` | 待机 | 无 |
+| `TELEOP` | 遥控 | `/cmd_vel_teleop` |
+| `MAPPING` | 建图中（人开车扫图） | `/cmd_vel_teleop` |
+| `LOCALIZING` | 重定位中（人在 RViz 点 2D Pose Estimate） | 无 |
+| `NAVIGATING` | 自主导航 | `/cmd_vel`（Nav2 的输出） |
+| `ESTOP` | 急停，粘性 | 无（20 Hz 压零速） |
+| `ERROR` | 故障，粘性 | 无（20 Hz 压零速） |
+
+#### 迁移表（谁能进谁）
+
+| 从 \ 到 | TELEOP | MAPPING | LOCALIZING | NAVIGATING | ESTOP | IDLE |
+|---|---|---|---|---|---|---|
+| `IDLE` | ✅ | ✅ | ✅ | ✅ | ✅（任何状态都能进） | — |
+| `TELEOP` | — | ❌ | ❌ | ❌ | ✅ | ✅ |
+| `MAPPING` | ❌ | — | ❌ | ❌ | ✅ | ✅ |
+| `LOCALIZING` | ❌ | ❌ | — | ❌ | ✅ | ✅ |
+| `NAVIGATING` | ❌ | ❌ | ❌ | — | ✅ | ✅ |
+| `ESTOP` | ❌ | ❌ | ❌ | ❌ | — | 只能 RESET |
+| `ERROR` | ❌ | ❌ | ❌ | ❌ | ✅ | 数据恢复后 RESET |
+
+**为什么不能 TELEOP → NAVIGATING 直达**：中间必须经过 `IDLE`。这不是官僚，是安全边界——**进自主导航前必须回到「车已停稳」的中性态**，否则上一状态残留的速度会直接带进导航。
+
+#### 准入检查：运动态要求数据健康
+
+进 `TELEOP` / `MAPPING` / `NAVIGATING` 之前先查 `/odom`、`/scan` 是否在超时阈值内。不健康就拒绝，而不是「先进去再 ERROR」。
+
+实测（不起仿真直接切 TELEOP）：
+
+```
+拒绝迁移：进入 TELEOP 需要数据健康，但 /odom（0.5s 内无数据）、
+/scan（1.0s 内无数据）。先确认仿真/底盘已启动
+```
+
+这补上了 8.4 留下的缺口——**在门口拦住，比进去再报警干净**。
+
+#### 操作变化（重要）：teleop 必须改话题
+
+```bash
+# 现在必须这样启动遥控
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -r cmd_vel:=cmd_vel_teleop
+```
+
+Nav2 **完全不用改**，继续用默认 `/cmd_vel`。
+
+> 为什么是改 teleop 而不是改 Nav2：`nav2_bringup/launch/navigation_launch.py` 里
+> `velocity_smoother` 的 remap（`cmd_vel_smoothed → cmd_vel`）是硬编码的，要改得自己写一套
+> Nav2 launch 包装。而改 teleop 只要加一个参数。**改动最小的一侧，才是该动的一侧。**
+
+#### 实测记录（隔离实例）
+
+| 场景 | 结果 |
+|---|---|
+| 不起仿真，`IDLE → TELEOP` | 被拒（数据不健康）✓ |
+| 起仿真后 `IDLE → TELEOP` | `TELEOP（听=teleop）` ✓ |
+| TELEOP 下发 `/cmd_vel_teleop 0.3` | `x 0.0031 → 0.7533`，**+0.750 m** ✓ |
+| TELEOP 下发 `/cmd_vel 0.5` | `x 0.7533 → 0.7529`，**−0.000 m**（拦住）✓ |
+| `TELEOP → NAVIGATING` 直达 | 被拒，仍 `TELEOP` ✓ |
+| `TELEOP → IDLE → NAVIGATING` | `NAVIGATING（听=nav）` ✓ |
+| NAVIGATING 下发 `/cmd_vel 0.3` | `x 0.7526 → 1.4880`，**+0.735 m** ✓ |
+| NAVIGATING 下发 `/cmd_vel_teleop 0.5` | `x 1.4880 → 1.4874`，**−0.001 m**（拦住）✓ |
+| `NAVIGATING → ESTOP` | 成功（安全动作不受迁移表约束）✓ |
+| `ESTOP → RESET` | `IDLE` ✓ |
+
+**这两行 −0.000 / −0.001 就是「分权」的全部意义**：导航时你按 `i` 完全没用，方向盘只有一个主人。
+
+#### 诊断提示
+
+如果 TELEOP 下按键没反应，而日志里 `拦截(nav=N)` 在涨，说明 teleop 忘了 remap（速度发到了 `/cmd_vel`，被当成 Nav2 的源拦掉了）。终端 D 会每 10 秒警告一次：
+
+```
+TELEOP 状态下拦下了 N 条 nav 源速度。如果你用的是 teleop，请确认启动时加了
+-r cmd_vel:=cmd_vel_teleop
+```
+
+#### 还没做的
+
+- `MAPPING` / `LOCALIZING` 目前只是状态名 + 分权规则，**没有和 slam_toolbox / AMCL 联动**（进入时不会自动起 SLAM）。这属于 8.9 启动整合。
+- `NAVIGATING` 还不会自己调用 Nav2 —— 现在只是「准备好接收 Nav2 的速度」，谁去发 `NavigateToPose` 是 8.6 的事。
