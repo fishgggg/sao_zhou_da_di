@@ -2027,3 +2027,293 @@ Grid / RobotModel（Transient Local）/ Map（Transient Local）/ Path（`/plan`
 - `/cmd_vel` 出现非零 `linear.x` / `angular.z`
 - `odom` 位置**持续变化**
 - 最终 `SUCCEEDED`，且车停在目标附近
+
+---
+
+## 阶段 8 · 任务状态机与安全逻辑
+
+### 为什么状态机不是「写个 switch」
+
+大多数人第一次做状态机，会写一个 `if state == "NAVIGATING": ...` 的节点，让它跟遥控器**同时**往 `/cmd_vel` 发速度。这个做法在真车上会直接导致「急停不生效」：
+
+```
+teleop  ──0.2 m/s──► /cmd_vel
+状态机  ──0.0 m/s──► /cmd_vel     ← 两条命令在同一条话题上，谁后到算谁的
+```
+
+`/cmd_vel` 是**普通话题，不是命令队列**：多个发布者同时写，订阅端（底盘）只看到"最近收到的这一条"。teleop 每 0.5 秒发一条 0.2，状态机就算连发十次零速，只要 teleop 还在按着，车就不会停。
+
+所以真正要做的第一件事不是写状态机，而是**建立唯一的速度出口**：
+
+```
+teleop ─┐
+Nav2   ─┼─► /cmd_vel ─► [任务状态机] ─► /cmd_vel_motor ─► 底盘插件
+急停    ─┘              唯一发布者
+```
+
+> **判据**：底盘只订阅一个话题，且这个话题只有一个发布者。
+> 只要这条不成立，"急停"就只是一种建议，不是一种保证。
+
+### 阶段 8 拆成 6 步（每步独立可验证）
+
+| 步 | 加什么 | 验收判据 |
+|---|---|---|
+| 8.1 | 底盘改听 `/cmd_vel_motor`（装闸门） | `/cmd_vel` 无订阅者；往 `/cmd_vel_motor` 发速度车会动 |
+| 8.2 | 状态机进程骨架 + 直通转发 | teleop 恢复能动；`/mission_state` 打出 `IDLE` |
+| 8.3 | 急停（ESTOP） | 行驶中触发急停，车 0.5 秒内停住，且**不会自己恢复** |
+| 8.4 | 看门狗（数据超时） | 杀掉 `/odom` 源，2 秒内自动进 `ERROR` 并停车 |
+| 8.5 | 状态迁移表（准入条件） | 未建图时进不了 `NAVIGATING` |
+| 8.6 | 接 Nav2 Action + 错误恢复 | 目标失败 → `ERROR` → `/reset` → `IDLE` |
+
+---
+
+### 8.1 装闸门：让底盘只认一个话题
+
+#### 改什么（一行）
+
+`xuegecar_sim_description/urdf/xuegecar_sim.urdf.xacro`，差速插件的 `<ros>` 块内（现 **L290**）：
+
+```xml
+<plugin name="diff_drive" filename="libgazebo_ros_diff_drive.so">
+  <ros>
+    <namespace>/</namespace>
+    <remapping>cmd_vel:=cmd_vel_motor</remapping>
+  </ros>
+```
+
+`libgazebo_ros_diff_drive.so` 内部用相对名 `cmd_vel` 订阅速度（已用 `strings` 核实该字符串存在），`<remapping>` 把它的订阅目标改到 `/cmd_vel_motor`。**改的是底盘的耳朵，不是说话的人**——因此不需要动 teleop、不需要动 Nav2，它们照旧往 `/cmd_vel` 发，只是暂时没人听。
+
+同一套机制本项目已经用过一次：雷达插件里 `<remapping>~/out:=scan</remapping>`。
+
+#### 为什么不用「状态机也发 /cmd_vel + 抢话题」
+
+见上文。抢话题做不到「切断」，只能做到「比谁发得勤」。真车、仿真、Nav2 三者叠加时，这种实现 100% 会出「急停后车还在走」的事故。
+
+#### 实测记录（AI 代跑）
+
+隔离实例：`ROS_DOMAIN_ID=42`、`GAZEBO_MASTER_URI=http://127.0.0.1:11399`、`gui:=false`——不干扰学生同时开着的 Gazebo/Nav2/RViz 会话（实测时确有 3 个活动终端在跑）。
+
+| 检查 | 结果 |
+|---|---|
+| `/cmd_vel` 端点 | `Unknown topic '/cmd_vel'`（**0 发布者 0 订阅者**） |
+| `/cmd_vel_motor` 端点 | 订阅者数 1，`Node name: diff_drive` |
+| 往 `/cmd_vel` 发 `linear.x=0.2` | 阻塞在 `Waiting for at least 1 matching subscription(s)...`，车不动 |
+| 往 `/cmd_vel_motor` 发 `linear.x=0.2` | `odom.x: 0.011 → 0.821`（约 4 秒，0.2 m/s ✓） |
+| 往 `/cmd_vel_motor` 发 `linear.x=0.0` | 停稳后 `odom.x: 1.0387 → 1.0382`（抖动 < 1mm，确实停了） |
+
+#### 学生验证（4 个终端，注意顺序）
+
+```bash
+# [终端 A] 先 Ctrl+C 掉当前 launch —— 你正在跑的那个 gzserver 还是旧配置
+ros2 launch xuegecar_sim_bringup gazebo.launch.py
+
+# [任意终端] 闸门装好了吗
+ros2 topic info /cmd_vel_motor -v      # 应看到 diff_drive 的 SUBSCRIPTION
+ros2 topic info /cmd_vel -v            # 应显示 0 个端点
+
+# [终端 C] 遥控 —— 预期「按 i 车不动」，这不是坏了
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+
+# [任意终端] 手动给油门，车应该动
+ros2 topic pub -r 10 /cmd_vel_motor geometry_msgs/msg/Twist "{linear: {x: 0.1}}"
+```
+
+#### 三个必须记住的现象
+
+1. **按 `i` 不动是正确行为**。它证明闸门真的在物理通路上，不是在代码注释里。
+2. **`Ctrl+C` 停发 ≠ 停车**。底盘会保持最后收到的速度一直走——这是真车电机的共性，也是 8.3「急停必须主动发零速并持续发」的原因。
+3. **一条零速命令到车真正停住之间有几百毫秒**（本次实测滑行了约 0.2 米才停稳）。所以急停不能只发一次，要在一个循环里持续发，直到 `odom` 证实速度为 0。
+
+> 代价：从 8.1 到 8.2 之间，**遥控和 Nav2 都会暂时失效**（它们还在发 `/cmd_vel`，没人听）。
+> 这是刻意的——先把闸门装好，再把钥匙交出去。
+
+---
+
+### 8.2 状态机骨架 + 直通转发
+
+#### 新增的包与文件
+
+```
+src/xuegecar_sim_mission/            ← ament_python 包
+├── package.xml                      rclpy / geometry_msgs / std_msgs
+├── setup.py                         entry point: mission_control
+├── setup.cfg
+├── resource/xuegecar_sim_mission
+└── xuegecar_sim_mission/
+    ├── __init__.py
+    └── mission_control.py           状态 + 唯一速度出口（约 100 行）
+```
+
+#### 它现在连接的四个话题
+
+| 方向 | 话题 | 类型 | 说明 |
+|---|---|---|---|
+| 入 | `/cmd_vel` | `geometry_msgs/Twist` | 所有速度来源（teleop / Nav2） |
+| 出 | `/cmd_vel_motor` | `geometry_msgs/Twist` | 唯一出口，底盘只认这个 |
+| 出 | `/mission_state` | `std_msgs/String` | 当前状态，1 Hz 周期发布（latched 效果靠周期重发） |
+| 入 | `/mission_command` | `std_msgs/String` | 切换命令（8.6 升级为 action/srv） |
+
+#### 三个设计决定（以及为什么）
+
+1. **速度放行用白名单**（`VELOCITY_ALLOWED = {'TELEOP'}`）。以后加 `NAVIGATING` 就是往集合里加一项；**漏加的状态默认不放行**。反过来写成黑名单 `if state == 'IDLE': return`，以后新增 `ERROR` 忘了加，结果就是错误状态下照样能开车。这叫 fail-closed。
+2. **切换用话题而不是服务**。`std_srvs/SetBool` 表达不了 7 个状态，自定义 srv 现在还不值得；话题两行命令就能测。等 8.6 接 Nav2 时再升成 action。
+3. **不设 `use_sim_time`**。节点只用自己的时钟做超时判断（8.4 会按「收到消息的时刻」打时间戳，而不是比较消息头里的仿真时间）——真机上时钟不同步是常态，按接收时刻计时更稳。
+
+#### 实测记录（AI 代跑，隔离实例 ROS_DOMAIN_ID=42 / :11399）
+
+| # | 检查 | 结果 |
+|---|---|---|
+| 1 | `/cmd_vel_motor` 端点 | 发布者 1 = `mission_control`；订阅者 1 = `diff_drive` ✓ |
+| 2 | `/mission_state` | `data: IDLE` |
+| 3 | `IDLE` 下发 `/cmd_vel 0.2` | `odom.x: 0.00618 → 0.00754`（<1.5 mm，纯求解器抖动）→ **挡住了** |
+| 4 | 切 `TELEOP` 后发 `/cmd_vel 0.2` | `odom.x: 0.00754 → 0.8162` → **放行了** |
+| 5 | 节点日志计数 | `state=TELEOP 转发=1 拦截=1` |
+| 6 | 未知状态命令 `{data: FLYING}` | 日志 `拒绝迁移：未知状态 'FLYING'`，状态不变 |
+
+#### ⚠️ 8.2 的已知缺口（这是 8.3 存在的理由）
+
+**切出 TELEOP 之后车不会自己停。** 实测（干净复测）：
+
+```
+倒退 0.15 m/s，切 IDLE 前          odom.x = 1.5425
+切 IDLE 后                        odom.x = 1.0779
+再等 3 秒                         odom.x = 0.4702      ← 还在以 0.15 m/s 倒退
+```
+
+原因不是状态机写错了，而是**底盘的行为**：差速插件收到一条速度就一直执行，没人发零速它就不会停。状态机只是"不再转发"，而"不再转发" ≠ "发零速"。
+
+> 这一条必须记住：**任何"停止命令"的本质都是「主动发一条零速并持续确认它生效」，而不是「不再发速度」。**
+> 8.3 的急停就补在这里——切出 TELEOP 时主动发零速，且在 ESTOP 状态里以 20 Hz 持续发。
+
+#### 一个验证方法上的坑（差点写出假结论）
+
+第一次测这个缺口时，数据是 `1.8500 → 1.8499`，看起来"切 IDLE 后车立刻停了"，差点据此写下"缺口不存在"。实际是：在切 IDLE 之前，车已经以 0.2 m/s 跑了十几秒、**撞在墙上**（房间 4×4，墙在 ±2.0，卡住时 odom.x≈1.85），撞墙和切状态两个变量混在一起，观测被污染。
+
+教训：**测"某个动作是否让车停"时，必须先确认车在观测窗口内本来是有能力动的**（远离墙壁、有足够行程、速度方向朝开阔处）。上一节（阶段 6）的"AI 连续三次误判"也是同一类错误——错在验证方法，不在代码。
+
+#### 学生验证（5 步）
+
+```bash
+# [终端 A] 仿真（若已在跑就跳过）
+ros2 launch xuegecar_sim_bringup gazebo.launch.py
+
+# [终端 D] 启动状态机 —— 新开一个终端
+ros2 run xuegecar_sim_mission mission_control
+
+# [终端 X] 看状态（应该是 IDLE）
+ros2 topic echo /mission_state
+
+# [终端 C] 遥控 —— 此时按 i 仍然不动（IDLE 不放行）
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+
+# [终端 X] 切到 TELEOP，然后回终端 C 按 i —— 车应该动
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
+
+# [终端 X] 观察计数（转发数应随你按 i 增长）
+#   日志在终端 D 里，每 2 秒一行 state=... 转发=... 拦截=...
+```
+
+#### 用户级验收（AI 用伪终端代按真键，用的是真的 `teleop_twist_keyboard`）
+
+按键不是靠 `ros2 topic pub` 模拟的——把 teleop 放进 `script -qec` 的伪终端里，等 3 秒（确认它已进入 raw 模式）再 `printf 'i'`，这样按下的是学生真正会按的那个键。
+
+| 验收 | 动作 | 数据 | 结论 |
+|---|---|---|---|
+| A | `IDLE` 下按 `i` | `odom.x: 0.00360 → 0.00801`（4.4 mm） | 不动 ✓ 拦截计数 +1 |
+| B | 切 `TELEOP` 后按 `i` | `odom.x: 0.00954 → 1.85000`（走 1.84 m） | 能动 ✓ 转发计数 +4 |
+| C | `TELEOP` 下按 `k` | `0.73502 → 0.73568 → 0.73636`（累计 0.69 mm） | 停住 ✓ |
+
+C 用的是"按 i 走 1.5 秒（约 0.73 m）再按 k"的序列——**从原点出发、离墙足够远**，这是刻意设计的，见下。
+
+#### 同一个坑踩了两次：撞墙污染观测
+
+验 C 的第一次尝试，数据是 `1.8500 → 1.84999`，怎么看都是"按 k 后一动不动"。但那次车在按 k 之前就已经撞墙停在 1.85 了——**撞墙和按 k 两个变量叠在一起，观测无效**。
+
+改成"从原点出发、先走 0.73 m 再按 k"之后，才拿到 `0.73502 → 0.73636` 这种能说明问题的数据（0.69 mm 是物理引擎的静摩擦抖动，不是运动）。
+
+> **判据**：验收任何"让车停下来"的动作，先问一句「在这个观测窗口里，车本来有能力动吗？」
+> —— 起点离墙够远、行程够长、速度方向朝开阔处。否则你测到的是墙，不是你的代码。
+
+#### 顺带确认的一个 teleop 细节
+
+真按 `i` 之后 teleop 会**持续**以 0.5 m/s 发布（不是按一次发一条），所以 A/B 之间必须用 `k` 明确停车，不能指望"松开键就停"。这也解释了为什么 `IDLE` 下按 `i` 之后车不会因为"按键结束"而动——它压根没收到过放行的速度。
+
+---
+
+### 8.3 急停：从「不转发」到「真的停」
+
+#### 这一版加了三个机制
+
+| 机制 | 实现 | 为什么需要 |
+|---|---|---|
+| 立刻清零 | `_set_state()` 里，目标状态不在放行名单时立刻 `publish(Twist())` | 底盘上一条命令可能是 0.3 m/s，必须**主动覆盖**，不能等 |
+| 持续压零速 | 20 Hz 定时器 `enforce_safe()`，ESTOP 里每 50 ms 发一帧零速 | 底盘没有「命令过期」概念；单帧可能丢；50 ms 比任何速度源都密 |
+| 粘性急停 | `STICKY = {'ESTOP'}`，只有 `RESET` 能离开 | 急停不能被下一个命令冲掉，必须由人显式复位 |
+
+#### 为什么不「销毁订阅」
+
+一个直觉做法是急停时 `destroy_subscription(cmd_sub)`，物理切断输入。问题：重新启用要重建 DDS 连接，恢复延迟几百毫秒，而且「订阅还在但状态不放行」本来就已经拦住了。**拦截 + 零速压制**既能挡住输入，又能主动纠正底盘的残留速度，比销毁订阅更彻底。
+
+#### 实测（探针节点：同一条时间轴里发命令 + 采 `/odom`，避开 CLI 发现延迟）
+
+| 步骤 | 观测 |
+|---|---|
+| 切 TELEOP，发 `0.3 m/s` | `x=0.4059, vx=0.300` |
+| **发 ESTOP** | `x=0.4059`（发命令瞬间） |
+| 首次观测到 `abs(vx)<0.01` | **+310 ms**，`x=0.4541`，急停后**多走 48.2 mm** |
+| ESTOP 里再发 `0.5 m/s` | `x: 0.4537 → 0.4535`（0.2 mm，纹丝不动），state 仍 ESTOP |
+| ESTOP 下发 `TELEOP` | state **仍是 ESTOP**（粘性，日志 `拒绝迁移：ESTOP 是粘性状态，必须先发 RESET`） |
+| 发 `RESET` | state → `IDLE` ✓ |
+| 20 Hz 计数 | 约 2 秒内 39 帧（19.5 Hz ✓） |
+| 从 IDLE 直接发 ESTOP | 成功进入，日志 `!!! 急停：IDLE → ESTOP` ✓ |
+
+#### 那 310 ms 是从哪来的（这道题可以算出来）
+
+`xuegecar_sim.urdf.xacro` **L301**：
+
+```xml
+<max_wheel_acceleration>1.0</max_wheel_acceleration>
+```
+
+差速插件对轮速的变化率做了限幅。若它限制的是**轮子线速度**（m/s²），那么从 `0.3 m/s` 减到 `0` 需要：
+
+```
+t = v / a = 0.3 / 1.0 = 0.3 s
+```
+
+**实测 310 ms。** 两个独立来源（参数推导 + 实测）吻合，说明这个限幅确实是 1 m/s²。
+
+> 教学结论：**急停的「最后一米」不在你的 Python 里，在底盘的加速度限幅里。**
+> 状态机能在 1 帧内发出零速（<50 ms），但轮子要从 0.3 m/s 停下来，物理上要 0.3 秒、多走 4.8 厘米。
+> 真车上这段距离由电机惯性和减速机决定，想把急停做快，得动硬件（抱闸）或改 `max_wheel_acceleration`——但那会让所有加速/减速都变粗暴。
+
+#### 另一个必须知道的边界
+
+这次进的 `ESTOP` 是由人（或脚本）触发的。**系统自己发现危险时怎么进 ESTOP**，那是 8.4 看门狗的事：
+数据超时 → 自动进 `ERROR`（不是 ESTOP——因为「数据没了」和「人按了急停」在语义上不同，
+复位条件也不同）。8.4 会把 `SAFETY_HOLD` 扩成 `{'ESTOP', 'ERROR'}`，两个状态都压零速。
+
+#### 学生验证（6 步）
+
+```bash
+# [终端 A] 仿真    [终端 D] ros2 run xuegecar_sim_mission mission_control
+# [终端 C] teleop
+
+# 1. 切 TELEOP，按 i 让车走起来
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
+
+# 2. 车走着的时候急停（另开 [终端 X]）
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: ESTOP}"
+# 判据：车在 0.3 秒内停住，多走不超过 5 厘米；终端 D 出现 ERROR 级日志「!!! 急停」
+
+# 3. 急停状态下继续按 i —— 车不动
+# 4. 直接发 TELEOP —— 被拒绝，state 仍是 ESTOP
+ros2 topic echo /mission_state --once
+
+# 5. 复位
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: RESET}"
+# 判据：state → IDLE，此时按 i 仍不动（IDLE 不放行）
+
+# 6. 回 TELEOP 确认车能动，收工
+ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
+```
