@@ -3485,3 +3485,104 @@ bash src/xuegecar_sim_bringup/scripts/regression.sh
 ```
 
 **以后改任何东西，先跑这一条。** 绿了再谈新功能，红了先看哪一项退化了。
+
+---
+
+## 阶段 11 · 与现有代码对照
+
+> 对照对象：`C:\Users\Y\Desktop\ros_car\xuegeros_ws\xuegeros_ws\src`（**13 个包**，此前记录写 14，以磁盘为准）
+> 对照方法：读 package.xml / launch / 源码里的参数声明，不凭记忆。
+
+### 一、包结构对照
+
+| 实车项目（13 包） | 职责 | 仿真项目里的对应 |
+|---|---|---|
+| `xuegecar_description` | URDF/网格 | `xuegecar_sim_description` |
+| `xuegecar_bringup` | 启动 + 一个订阅 `/odom` 的 demo 节点 | `xuegecar_sim_bringup` |
+| `xuegecar_mavlink_bridge` | **底盘驱动**：串口 ↔ MAVLink，出 `/odom` `/imu` `/scan`，收 `/cmd_vel` | Gazebo `diff_drive` 插件 |
+| `camsense_lidar` | 雷达串口驱动 | Gazebo ray 传感器插件 |
+| `slam_gmapping` / `openslam_gmapping` | 建图方案 A | `slam_toolbox`（阶段 6） |
+| `xuegecar_cartographer` | 建图方案 B | — |
+| `xuegecar_navigation2` | Nav2 参数 + 3 张地图 + `ekf.yaml` | `config/nav2_params.yaml` + `my_map` |
+| `xuegecar_camera` | HTTP 视频推流 | — |
+| `xuegecar_qt_gui` / `xuegecar_servo_qt_gui` | Qt 上位机（遥测 + 舵机云台） | — |
+| `leap_interfaces` | 自定义 msg/srv | — |
+| `xuegeros_demo` | 总启动 demo | `bringup.launch.py` |
+
+**粒度差异**：实车把一个功能拆成独立包（雷达、相机、每个建图方案各一包），因为要独立编译/替换；
+仿真 3 个包就够，因为 Gazebo 插件替你承担了驱动层。
+
+### 二、接口对照（最值钱的一张表）
+
+`xuegecar_mavlink_bridge/src/mavlink_bridge.cpp` 的参数声明（L193-204）：
+
+| 参数 | 实车默认值 | 我们仿真里的名字 | 一致？ |
+|---|---|---|---|
+| `cmd_vel_topic` | `/cmd_vel` | `/cmd_vel`（Nav2 的源）/ `/cmd_vel_motor`（底盘入口） | ⚠️ 我们拆成了两条 |
+| `odom_topic` | `/odom` | `/odom` | ✅ |
+| `scan_topic` | `/scan` | `/scan` | ✅ |
+| `imu_topic` | `/imu` | `/imu` | ✅ |
+| `odom_frame_id` | `odom` | `odom` | ✅ |
+| `base_frame_id` | **`base_link`** | **`base_footprint`** | ⚠️ 不同 |
+| `imu_frame_id` | `imu_link` | `imu_link` | ✅ |
+| `scan_frame_id` | `laser_frame` | `laser_frame` | ✅ |
+| 串口 | `port=ttyUSB0` | 无（仿真无硬件） | — |
+
+**结论**：除了「底盘入口话题名」和「base frame 名」，**接口几乎逐字一致**。
+这说明前 10 个阶段建的接口表不是自娱自乐——它就是实车的接口。
+
+**两条差异怎么处理**：
+
+1. `cmd_vel` vs `cmd_vel_motor`：把 mavlink_bridge 的 `cmd_vel_topic` 参数设成 `cmd_vel_motor` 即可
+   （它是参数，不用改代码）。这样状态机成为唯一出口，8.1-8.5 的安全逻辑直接生效。
+2. `base_link` vs `base_footprint`：两种做法——
+   - 改 URDF 的根 frame 名（影响所有 TF 消费方）
+   - 或者在 launch 里把 mavlink_bridge 的 `base_frame_id` 设为 `base_footprint`，并让 URDF 保留 base_footprint→base_link 的 fixed joint（**推荐**，改动最小）
+
+### 三、实车有、仿真没有的四样
+
+| 能力 | 实车做法 | 为什么仿真没做 | 影响 |
+|---|---|---|---|
+| **EKF 状态估计** | `xuegecar_navigation2/config/ekf.yaml`（robot_localization 融合轮速 odom + IMU） | Gazebo 的 odom 是"真值"，不需要融合 | 实车上 odom 会漂、IMU 有噪声，不融合导航会抖 |
+| 雷达串口驱动 | `camsense_lidar` 独立包 | Gazebo 插件代劳 | 换硬件时才需要 |
+| Qt 上位机 | 两个 GUI 包（遥测 + 舵机云台） | 本课用 RViz + 终端 | 实车调试需要可视化面板 |
+| 多地图切换 | `maps/` 下 3 张 yaml | 只有 `my_map` | 实车要多场地 |
+
+### 四、仿真有、实车没有的四样（本课真正的加值）
+
+| 能力 | 仿真里 | 实车项目里 |
+|---|---|---|
+| **任务状态机**（7 状态 + 迁移表） | `mission_control` | ❌ 没有 |
+| **唯一速度出口 + 分权** | `/cmd_vel_motor` + `SOURCE_BY_STATE` | ❌ 所有节点直接发 `/cmd_vel` |
+| **急停（粘性 + 20Hz 压零速）** | 8.3 | ❌ 没有 |
+| **看门狗（数据超时 → ERROR）** | 8.4 | ❌ 没有 |
+| **回归脚本** | `regression.sh`（11 项） | ❌ 没有 |
+
+> **这是本课最重要的发现**：实车项目在「驱动层」比仿真完整得多（串口、EKF、GUI），
+> 但在「安全层」几乎空白——没有任何东西阻止两个节点同时发 `/cmd_vel`，也没有急停和数据超时保护。
+> 你在阶段 8-9 加的东西，恰好是实车最缺的部分。
+
+### 五、把仿真代码迁到实车的清单
+
+| 步 | 做什么 | 判据 |
+|---|---|---|
+| 1 | 起 `mavlink_bridge`，参数 `cmd_vel_topic:=cmd_vel_motor`、`base_frame_id:=base_footprint` | `ros2 topic echo /odom` 有数据 |
+| 2 | 起 `mission_control`（原样，不改代码） | `ros2 param get /mission_control initial_state` 有值 |
+| 3 | `ros2 topic info /cmd_vel_motor` | 发布者 1（mission），订阅者 1（mavlink_bridge） |
+| 4 | 切 TELEOP 按 `i` | 车真的动 |
+| 5 | 测急停 | 0.5 秒内停（实车取决于电机，可能比仿真慢） |
+| 6 | 拔串口（模拟数据中断） | 2 秒内进 ERROR |
+| 7 | 改 `bringup.launch.py` 的 `sim:=false` 分支：把 `fake_chassis` 换成 `mavlink_bridge` | 同一条命令起实车 |
+
+**不需要改的**：`mission_control.py` 一行都不用动。这就是 9.3 那步「抽象层」的价值。
+
+### 六、差异背后的设计取舍
+
+| 取舍 | 实车选了 | 仿真选了 | 理由 |
+|---|---|---|---|
+| 底盘入口 | `/cmd_vel` 直连 | `/cmd_vel_motor` 经状态机 | 单机调试简单 vs 多源安全 |
+| 状态估计 | EKF 融合 | 用真值 | 硬件有噪声 vs 无噪声 |
+| 建图 | gmapping / cartographer | slam_toolbox | 历史选型 vs 新方案 |
+| 启动 | 每包一个 launch | 一个 bringup 汇总 | 独立部署 vs 教学/单机 |
+
+**没有哪个更好，只有场景不同。** 但「安全层」是任何场景都不该缺的——这是本课从 8 到 10 反复强调的东西。
