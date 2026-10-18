@@ -2317,3 +2317,86 @@ ros2 topic pub --once /mission_command std_msgs/msg/String "{data: RESET}"
 # 6. 回 TELEOP 确认车能动，收工
 ros2 topic pub --once /mission_command std_msgs/msg/String "{data: TELEOP}"
 ```
+
+---
+
+## 补课：轮子是怎么转起来的（一条 Twist 的完整旅程）
+
+> 这一节回答「我不理解轮子相关的内容」。它不属于某个阶段，是贯穿阶段的底层机制。
+
+### 1. URDF 里，一个轮子由两样东西组成
+
+```
+link（轮子本身）               joint（轮子怎么装在车上）
+├─ visual/collision: 圆柱      ├─ type="continuous"   能无限转（不是 fixed 不能动、不是 revolute 有角度限位）
+│  radius=0.0325  length=0.02  ├─ origin xyz="0 ±0.085 0"  装在车的左右两侧
+├─ inertial: 质量 0.1kg        ├─ axis xyz="0 1 0"    绕 y 轴转
+│  转动惯量按圆柱算             └─ limit velocity="20" 最大 20 rad/s
+```
+
+对应 `xuegecar_sim.urdf.xacro` **L110-135**（`wheel` 宏）。
+
+**为什么 axis 是 y 轴**：ROS 的坐标约定是 **x 前、y 左、z 上**（REP-103）。轮子要"向前滚"，转轴就必须横向——也就是 y 轴。右手定则验一下：绕 +y 转，轮子最低点的速度指向 −x，所以车身被推向 +x（前进）。**轴的符号决定"正转是前进还是后退"，写反了车就会倒着走。**
+
+### 2. 三个轮子的高度是自洽算出来的
+
+```
+wheel_radius   = 0.0325   轮心到地面
+base_link      = z 0      定在轮心高度（所以轮心就在车身坐标原点）
+caster_z       = caster_radius - wheel_radius = 0.015 - 0.0325 = -0.0175
+                → 球心在轮心下方 1.75cm，球底 = -0.0175 - 0.015 = -0.0325 = 轮底 ✓
+```
+
+**两轮 + 一个万向球 = 三点支撑。** 少一个球，车会前后翻（两个轮子共轴，重心正压在轴上，一加速就低头）。
+
+### 3. Twist → 轮速：差速逆运动学（Gazebo 插件干的活）
+
+差速车的两个轮子只有两种运动组合：**同速 = 直行，反速 = 原地转**。
+
+```
+v_left  = v − ω · W/2
+v_right = v + ω · W/2          W = wheel_separation = 0.17 m
+```
+
+| 你发的 Twist | 左轮线速度 | 右轮线速度 | 轮子转速（rad/s = v/r） |
+|---|---|---|---|
+| `linear.x=0.3` | 0.3 | 0.3 | 各 9.23（≈88 rpm，1 秒滚 1.5 圈） |
+| `angular.z=1.0` | −0.085 | +0.085 | 左 −2.62、右 +2.62（原地左转 57°/秒） |
+| `x=0.2, z=0.5` | 0.1575 | 0.2425 | 差速转弯 |
+
+轮子转一圈车走 `2πr = 0.204 m`——这就是"轮半径"这个数字的全部意义：**v 和 ω 是抽象的，半径把它们翻译成轮子转多快。**
+
+### 4. 轮速 → odom：正运动学（同样由插件算）
+
+```
+d_left  = θ_left  · r        θ = 轮子转过的角度（joint 状态）
+d_right = θ_right · r
+车位移   Δs = (d_left + d_right) / 2
+车朝向   Δθ = (d_right − d_left) / W
+```
+
+累计这些 Δ 就是 `/odom`。**所以 odom 是"数轮子转了多少圈"推算出来的，不是测量的**——轮子打滑、地面不平、半径标定不准，误差就会一直累积。这就是为什么建图/导航还需要雷达 + AMCL 来纠偏：`map → odom` 修正，`odom → base_footprint` 由轮子积分。
+
+### 5. 整条链路
+
+```
+你的键盘 i
+  └─ teleop_twist_keyboard → /cmd_vel (Twist, 0.5 m/s)
+       └─ mission_control  ── 状态是 TELEOP?
+            └─ /cmd_vel_motor
+                 └─ gazebo_ros_diff_drive（50 Hz）
+                      ├─ 逆运动学：v_left/v_right = 0.5 −/+ …
+                      ├─ 加速度限幅：max_wheel_acceleration = 1.0 m/s²
+                      ├─ 转成 joint 速度 → Gazebo 物理引擎 → 轮子真的转
+                      └─ 读 joint 角度 → 正运动学 → /odom + odom→base_footprint TF
+```
+
+**急停那 310 ms 就卡在"加速度限幅"这一行**：0.3 m/s ÷ 1.0 m/s² = 0.3 s，代码发零速只要一帧，轮子减速要 0.3 秒。
+
+### 6. 三个容易混的数字
+
+| 数字 | 值 | 管什么 |
+|---|---|---|
+| `wheel_radius` | 0.0325 m | 线速度 ↔ 轮转速的换算 |
+| `wheel_separation` | 0.17 m | 直行 ↔ 转弯的分配（W 越小转得越急） |
+| `update_rate` | 50 Hz | 插件多久算一次、发一次 odom |
