@@ -76,13 +76,26 @@ wsl -e bash -lc 'source /opt/ros/humble/setup.bash && cd ~/xuegecar_sim_ws && co
 
 ## 五、版本控制
 
-| 位置 | 状态 |
-|---|---|
-| 记忆库 | git（本仓库），提交历史即文档演进 |
-| 仿真代码 `~/xuegecar_sim_ws` | git（M0 建立），提交即代码基线 |
-| 实车代码 / 固件 | 上游开源，不入库，只读 |
+| 位置 | 状态 | 远程 |
+|---|---|---|
+| 记忆库（本仓库） | git，**唯一远程真相** | `git@github.com:fishgggg/sao_zhou_da_di.git`（origin/master） |
+| 仿真代码 `~/xuegecar_sim_ws` | git（本地基线，不推远程） | 无 |
+| 实车代码 / 固件 | 上游开源，不入库，只读 | 无 |
 
-**纪律**：改仿真代码前先确认工作区干净（`git status`），改完单独提交。没有基线的改动等于没有改动——出问题无法回滚，也无法判断是谁引入的。
+### 代码提交流程（单向）
+
+```bash
+# 1. 在 WSL 改代码、构建、验证
+wsl -e bash -lc 'cd ~/xuegecar_sim_ws && source /opt/ros/humble/setup.bash && colcon build'
+# 2. 同步到本仓库镜像
+bash scripts/sync-code.sh
+# 3. 在本仓库提交并推送
+git add sim_ws && git commit -m "..." && git push
+```
+
+方向永远是 WSL → 镜像。`sim_ws/` 是代码镜像，不是构建位置；改镜像不会影响仿真，必须回 WSL 改。
+
+**纪律**：改动前先确认工作区干净（`git status`），改完单独提交。没有基线的改动等于没有改动——出问题无法回滚，也无法判断是谁引入的。
 
 ---
 
