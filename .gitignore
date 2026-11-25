@@ -1,2 +1,12 @@
 # Rivet 运行时数据（会话状态、本地知识库、sqlite 库），不进版本库
 .rivet/
+
+# ROS 2 构建产物（sim_ws 只存源码镜像，构建在 WSL ext4 上进行）
+sim_ws/build/
+sim_ws/install/
+sim_ws/log/
+
+# 编辑器 / 系统杂项
+.DS_Store
+Thumbs.db
+
