@@ -11,7 +11,7 @@
 |---|---|---|---|
 | **记忆库（总部）** | `D:\笔记位置存放\Agent项目记忆库\ROS2小车的项目` | 可读写 | 文档、计划、状态。git 仓库 |
 | **仿真代码（主战场）** | WSL `Ubuntu-22.04` → `~/xuegecar_sim_ws` | 可读写 | ROS 2 工作区，3 个包。git 仓库（M0 建立） |
-| **实车代码（对照源）** | `C:\Users\Y\Desktop\ros_car\xuegeros_ws\xuegeros_ws\src` | **只读** | 14 个包，开源原版。不入库、不改动 |
+| **实车代码（对照源）** | `C:\Users\Y\Desktop\ros_car\xuegeros_ws\xuegeros_ws\src` | **只读** | 13 个包，开源原版。不入库、不改动 |
 | **实车固件** | `C:\Users\Y\Desktop\ros_car\leap_demo` | **只读** | ESP32 底盘/摄像头固件，仅作参考 |
 
 Windows 与 WSL 是两套文件系统。**不要在 `/mnt/d` 上跑 `colcon build`**：慢，且会丢 Linux 可执行权限位。
@@ -95,7 +95,7 @@ wsl -e bash -lc 'source /opt/ros/humble/setup.bash && cd ~/xuegecar_sim_ws && co
 | `扫地机器人分支计划.md` | M0–M4 施工蓝图 + 接口契约 | 动手前、设计讨论 |
 | `阶段8接续说明.md` | 阶段 0–11 的历史交付与踩坑清单（已归档，不再更新） | 查历史细节 |
 | `ROS2小车仿真搭建教学.md` | 11 阶段完整讲义（160KB，含实测数据） | 查原理、查坑的成因 |
-| `ROS2小车项目结构详解.md` | 实车 14 包的结构与接口 | 查实车对照 |
+| `ROS2小车项目结构详解.md` | 实车 13 包的结构与接口 | 查实车对照 |
 | `ROS2小车项目资料.md` | 实车开源项目资料（静态阅读整理） | 同上 |
 | `ROS2基础补课.md` | 8 课基础概念（坐标系/SLAM/costmap/QoS 等） | 概念不清时 |
 | `面试问题和答案.md` | 仿真 20 题 + 实车 A-F 组 | 面试准备 |
